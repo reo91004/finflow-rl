@@ -342,25 +342,36 @@ class StockPortfolioEnv(gym.Env):
         # 이전 포트폴리오 가치 이력 저장
         self.portfolio_value_history.append(prev_portfolio_value)
 
+        # 최대 포트폴리오 가치 업데이트
+        self.max_portfolio_value = max(self.max_portfolio_value, prev_portfolio_value)
+        
+        # 최근 K일 가치만 유지
+        if len(self.portfolio_value_history) > REWARD_ACCUMULATION_DAYS + 1:
+            self.portfolio_value_history.pop(0)
+
+        # 파산 조건 확인
+        if prev_portfolio_value <= 1e-6:
+            terminated = True
+            truncated = False
+            raw_reward = -10.0  # 파산 시 큰 음수 보상
+            info = {
+                "portfolio_value": 0.0, "cash": 0.0, "holdings": self.holdings.copy(),
+                "weights": np.zeros_like(self.weights), "return": -1.0, "raw_reward": raw_reward
+            }
+            # 마지막 관측값은 현재 관측값 사용 (정규화)
+            last_obs_norm = self._normalize_obs(obs)
+            reward_norm = self._normalize_reward(raw_reward)
+            return last_obs_norm.astype(np.float32), float(reward_norm), terminated, truncated, info
+
+        # 행동 변화 페널티 계산 (L1 거리)
+        action_change_penalty = self.action_penalty_coef * np.sum(np.abs(action - self.prev_weights))
+
         # 거래 실행
         # 각 자산의 목표 가치 계산
-        target_value_allocation = action * self.portfolio_value
+        target_value_allocation = action[:-1] * prev_portfolio_value
         
-        # 거래 실행 (보유 자산 및 현금 업데이트)
+        # 실제 거래 실행 (매수/매도)
         self._execute_trades(target_value_allocation, current_prices)
-
-        # 자산 비중 계산
-        self.weights = np.zeros(self.n_assets + 1, dtype=np.float32)
-        if self.portfolio_value > 1e-8:
-            self.weights[:-1] = (self.holdings * current_prices) / self.portfolio_value
-            self.weights[-1] = self.cash / self.portfolio_value
-        else:
-            # 포트폴리오 가치가 0에 가까우면 원-핫 인코딩 (현금만 1)
-            self.weights[-1] = 1.0
-
-        # 행동 변화 페널티 계산 (거래 비용 외 추가 페널티)
-        weights_change = np.abs(self.weights - self.prev_weights).sum()
-        action_change_penalty = self.action_penalty_coef * weights_change
 
         # 최대 스텝 도달 또는 에피소드 종료 여부 확인
         terminated = False
@@ -380,80 +391,87 @@ class StockPortfolioEnv(gym.Env):
         else:
             next_obs_raw = self.data[self.current_step]
 
-        new_prices = next_obs_raw[:, 3]  # 다음 날 종가
-        new_prices = np.maximum(new_prices, 1e-6)  # 0 가격 방지
-        new_portfolio_value = self.cash + np.dot(self.holdings, new_prices)
+        next_prices = next_obs_raw[:, 3]  # 다음 날 종가
+        next_prices = np.maximum(next_prices, 1e-6)  # 0 가격 방지
+        new_portfolio_value = self.cash + np.dot(self.holdings, next_prices)
 
-        # 보상 계산: 일일 수익률
-        daily_return = (new_portfolio_value / prev_value_safe) - 1
-        
-        # 최대 포트폴리오 가치 업데이트 (드로우다운 계산용)
-        self.max_portfolio_value = max(self.max_portfolio_value, new_portfolio_value)
-        
-        # 수익률 이력 업데이트 (Sharpe ratio 계산용)
+        # 수익률 계산 및 이력 업데이트
+        prev_value_safe = max(prev_portfolio_value, 1e-8)  # 이전 가치가 0에 가까울 때 대비
+        current_value_safe = max(new_portfolio_value, 0.0)  # 현재 가치는 0이 될 수 있음
+        daily_return = (current_value_safe / prev_value_safe) - 1
         self.returns_history.append(daily_return)
-
-        # 현재 포트폴리오 가치 업데이트
+        
+        # 포트폴리오 가치 업데이트
         self.portfolio_value = new_portfolio_value
-        
-        # 자산 비중 업데이트
-        if new_portfolio_value > 1e-8:
-            self.weights[:-1] = (self.holdings * new_prices) / new_portfolio_value
-            self.weights[-1] = self.cash / new_portfolio_value
-        else:
-            self.weights[-1] = 1.0
 
-        # --- 보상 계산 부분 수정 ---
+        # 자산 비중 업데이트
+        if self.portfolio_value > 1e-8:
+            stock_weights = (self.holdings * next_prices) / self.portfolio_value  # 주식 비중
+            cash_weight = self.cash / self.portfolio_value  # 현금 비중
+            self.weights = np.append(stock_weights, cash_weight)
+        else:
+            self.weights = np.zeros(self.n_assets + 1)
+            
+        # 이전 가중치 저장 (다음 스텝의 변화 페널티 계산용)
+        self.prev_weights = self.weights.copy()
         
-        # 1. 일일 수익률 (단순화된 주요 보상 구성 요소)
-        return_component = np.tanh(daily_return) * REWARD_RETURN_WEIGHT
+        # 시장 변동성 업데이트 (최근 수익률의 표준편차)
+        if len(self.returns_history) > 1:
+            window_size = min(20, len(self.returns_history))
+            recent_vol = np.std(self.returns_history[-window_size:])
+            self.market_volatility_window.append(recent_vol)
+            # 최근 변동성만 저장
+            if len(self.market_volatility_window) > 100:  # 충분히 긴 이력 유지
+                self.market_volatility_window.pop(0)
+            
+            # 변동성 기반 클리핑 스케일 업데이트
+            self.volatility_scaling = self._calculate_volatility_scaling()
         
-        # 2. K-일 누적 수익률 계산 (더 긴 기간의 성과 고려)
+        # --- 보상 계산 ---
+        
+        # 1. K-일 누적 수익률 계산
         if len(self.portfolio_value_history) > REWARD_ACCUMULATION_DAYS:
             k_day_ago_value = self.portfolio_value_history[-REWARD_ACCUMULATION_DAYS-1]
             if k_day_ago_value > 1e-8:
-                k_day_return = (new_portfolio_value / k_day_ago_value) - 1
+                k_day_return = (current_value_safe / k_day_ago_value) - 1
             else:
-                k_day_return = 0.0
+                k_day_return = -1.0
         else:
+            # K일치 데이터가 없으면 일간 수익률 사용
             k_day_return = daily_return
         
-        # 장기 보상 보너스 적용 (k일 수익률이 양수일 때만)
-        long_term_bonus = REWARD_LONG_TERM_BONUS * np.tanh(k_day_return) if k_day_return > 0 else 0
+        # 2. Sharpe ratio 계산
+        sharpe_ratio = self._calculate_sharpe_ratio()
         
-        # 3. Sharpe ratio 계산
-        # 최소 window_size/2 이상의 데이터가 있을 때만 Sharpe ratio 반영
-        if len(self.returns_history) > REWARD_SHARPE_WINDOW // 2:
-            sharpe_ratio = self._calculate_sharpe_ratio()
-            sharpe_component = sharpe_ratio * REWARD_SHARPE_WEIGHT
-        else:
-            sharpe_component = 0.0
-            sharpe_ratio = 0.0  # 정보 반환용
-        
-        # 4. 드로우다운 페널티 계산 (손실에 대한 페널티)
+        # 3. 드로우다운 페널티 계산
         drawdown = self._calculate_drawdown()
         drawdown_penalty = REWARD_DRAWDOWN_PENALTY * drawdown
         
-        # 5. 최종 보상 계산 (각 구성 요소의 합)
-        raw_reward = return_component + sharpe_component + long_term_bonus - drawdown_penalty - action_change_penalty
+        # 4. 최종 보상 계산 (가중 합)
+        # 변동성 스케일링 적용 (높은 변동성 = 낮은 클리핑)
+        scaled_return = k_day_return * self.volatility_scaling
         
-        # 음수 보상 가중치 조정 (실패에 대한 더 강한 신호)
-        if raw_reward < 0:
-            raw_reward *= REWARD_NEGATIVE_WEIGHT
+        # 수익률 기여도 (tanh로 비선형 클리핑)
+        return_component = np.tanh(scaled_return) * REWARD_RETURN_WEIGHT
+        
+        # Sharpe ratio 기여도 (-1~1 범위로 클리핑)
+        sharpe_component = np.clip(sharpe_ratio / 3.0, -1, 1) * REWARD_SHARPE_WEIGHT
+        
+        # 최종 보상 계산
+        raw_reward = return_component + sharpe_component - drawdown_penalty - action_change_penalty
         
         # NaN/Inf 처리
         if np.isnan(raw_reward) or np.isinf(raw_reward):
-            raw_reward = -1.0
+            raw_reward = -1.0 # NaN/Inf 발생 시 페널티
         
-        # 보상 클리핑 - PPO 업데이트와 클리핑 범위 일치시키기
-        raw_reward = np.clip(raw_reward, REWARD_CLIP_MIN, REWARD_CLIP_MAX)
+        # 보상 클리핑 적용 (tanh 함수로 비선형 클리핑)
+        raw_reward = np.tanh(raw_reward) * 2.0  # -2.0~2.0 범위로 비선형 클리핑
         
         # 다음 상태 및 보상 정규화
         next_obs_norm = self._normalize_obs(next_obs_raw)
-        # 정규화된 보상도 반환하되, 원시 보상은 info로 전달
         reward_norm = self._normalize_reward(raw_reward)
-        
-        # 정보 업데이트 (원시 보상을 포함하여 PPO 업데이트에서 사용)
+
+        # 정보 업데이트
         info = {
             "portfolio_value": self.portfolio_value,
             "cash": self.cash,
@@ -465,7 +483,7 @@ class StockPortfolioEnv(gym.Env):
             "k_day_return": k_day_return if 'k_day_return' in locals() else 0.0,
             "sharpe_ratio": sharpe_ratio,
             "drawdown": drawdown,
-            "portfolio_change": (new_portfolio_value / prev_value_safe) - 1
+            "volatility_scaling": self.volatility_scaling
         }
         
         return next_obs_norm.astype(np.float32), float(reward_norm), terminated, truncated, info

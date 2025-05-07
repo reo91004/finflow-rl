@@ -365,230 +365,126 @@ class PPO:
 
     def compute_returns_and_advantages(self, rewards, is_terminals, values):
         """
-        GAE(Generalized Advantage Estimation)를 사용하여 Returns와 Advantages를 계산합니다.
+        Generalized Advantage Estimation (GAE)를 사용하여 Advantage와 Return을 계산합니다.
 
         Args:
-            rewards: 보상 배열 [T]
-            is_terminals: 종료 상태 플래그 배열 [T]
-            values: 가치 함수 추정치 배열 [T]
+            rewards (list): 에피소드/배치에서 얻은 보상 리스트.
+            is_terminals (list): 각 스텝의 종료 여부 리스트.
+            values (np.ndarray): 각 상태에 대한 크리틱의 가치 예측값 배열.
 
         Returns:
-            returns: 기대 수익 배열 [T]
-            advantages: 어드밴티지 배열 [T]
+            tuple: (returns_tensor, advantages_tensor)
+                   - returns_tensor (torch.Tensor): 계산된 Return (Target Value).
+                   - advantages_tensor (torch.Tensor): 계산된 Advantage.
+                   오류 발생 시 빈 텐서 반환.
         """
-        T = len(rewards)
-        
-        # 다음 상태 가치 추정 (마지막 상태는 종료 상태이거나 최대 길이를 초과한 경우 0으로 설정)
-        next_values = torch.cat([values[1:], torch.zeros(1).to(DEVICE)])
-        
-        # 마스크 생성 (종료 상태는 0, 그렇지 않으면 1)
-        masks = 1.0 - is_terminals.float()
-        
-        # GAE 계산
-        gae = 0
-        returns = []
-        advantages = []
-        
-        for t in reversed(range(T)):
-            # 델타 값 계산: rt + gamma * V(s_{t+1}) * mask - V(s_t)
-            delta = rewards[t] + self.gamma * next_values[t] * masks[t] - values[t]
-            
-            # GAE 재귀적 계산: A_t = delta_t + gamma * lambda * A_{t+1} * mask
-            gae = delta + self.gamma * LAMBDA_GAE * masks[t] * gae
-            
-            # returns와 advantages 앞에 추가 (역순 계산)
-            returns.insert(0, gae + values[t])
-            advantages.insert(0, gae)
-        
-        # 텐서로 변환
-        returns = torch.stack(returns)
-        advantages = torch.stack(advantages)
-        
-        # NaN/Inf 처리 (안정성 강화)
-        returns = torch.nan_to_num(returns, nan=0.0, posinf=5.0, neginf=-5.0)
-        advantages = torch.nan_to_num(advantages, nan=0.0, posinf=5.0, neginf=-5.0)
-        
-        # advantages 정규화 (학습 안정화)
-        if advantages.numel() > 1:  # 단일 요소가 아닌 경우에만 정규화
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        return returns, advantages
+        if not rewards or values.size == 0:
+            self.logger.warning("GAE 계산 시 rewards 또는 values 배열이 비어있습니다.")
+            return torch.tensor([], device=DEVICE), torch.tensor([], device=DEVICE)
+
+        returns = np.zeros_like(rewards, dtype=np.float32)
+        advantages = np.zeros_like(rewards, dtype=np.float32)
+        last_gae_lam = 0.0
+
+        next_value = values[-1] * (1.0 - float(is_terminals[-1]))
+
+        for i in reversed(range(len(rewards))):
+            mask = 1.0 - float(is_terminals[i])
+            delta = rewards[i] + self.gamma * next_value * mask - values[i]
+            last_gae_lam = delta + self.gamma * LAMBDA_GAE * mask * last_gae_lam
+            advantages[i] = last_gae_lam
+            returns[i] = last_gae_lam + values[i]
+            next_value = values[i]
+
+        try:
+            returns_tensor = torch.from_numpy(returns).float().to(DEVICE)
+            advantages_tensor = torch.from_numpy(advantages).float().to(DEVICE)
+        except Exception as e:
+            self.logger.error(f"Return/Advantage 텐서 변환 중 오류: {e}")
+            return torch.tensor([], device=DEVICE), torch.tensor([], device=DEVICE)
+
+        if torch.isnan(returns_tensor).any() or torch.isinf(returns_tensor).any():
+            returns_tensor = torch.nan_to_num(returns_tensor, nan=0.0)
+        if torch.isnan(advantages_tensor).any() or torch.isinf(advantages_tensor).any():
+            advantages_tensor = torch.nan_to_num(advantages_tensor, nan=0.0)
+
+        return returns_tensor, advantages_tensor
 
     def update(self, memory):
-        """
-        수집된 경험으로부터 PPO 정책 업데이트를 수행합니다.
+        """ 메모리에 저장된 경험을 사용하여 정책(policy)을 업데이트합니다. """
+        if not memory.states:
+            self.logger.warning("업데이트 시도: 메모리가 비어있습니다.")
+            return 0.0
 
-        Args:
-            memory: 수집된 경험이 저장된 메모리 객체
+        total_loss_val = 0.0
 
-        Returns:
-            float: 정책 손실 값
-        """
         try:
-            # 메모리가 충분히 차 있는지 확인
-            if len(memory) < 100:  # 최소 샘플 수
-                self.logger.warning(f"메모리에 충분한 샘플이 없음: {len(memory)}개. 업데이트 건너뜀")
-                return 0
-
-            # 메모리에서 배치 데이터 가져오기
-            states = memory.get_states_tensor().to(DEVICE)
-            actions = memory.get_actions_tensor().to(DEVICE)
-            old_log_probs = memory.get_log_probs_tensor().to(DEVICE)
-            rewards = memory.get_rewards_tensor().to(DEVICE)
-            is_terminals = memory.get_is_terminals_tensor().to(DEVICE)
+            old_states = torch.stack([torch.from_numpy(s).float() for s in memory.states]).to(DEVICE)
+            old_actions = torch.stack([torch.from_numpy(a).float() for a in memory.actions]).to(DEVICE)
+            old_logprobs = torch.tensor(memory.logprobs, dtype=torch.float32).to(DEVICE)
+            old_values = torch.tensor(memory.values, dtype=torch.float32).to(DEVICE)
             
-            # 이상치 처리: 보상 범위가 이미 환경에서 클리핑되었으므로 여기서는 극단적인 값만 처리
-            # 환경에서의 클리핑 범위보다 약간 더 넓게 설정 (-3.0~3.0)
-            rewards = torch.clamp(rewards, -3.0, 3.0)
+            # 원시 보상 사용 (메모리 재사용 문제 해결)
+            rewards = memory.get_raw_rewards_tensor().to(DEVICE)
             
-            # 현재 가치 추정
-            _, old_values = self.policy_old(states)
-            old_values = old_values.detach().squeeze()
-            
-            # GAE를 사용하여 returns와 advantages 계산
+            old_values_np = old_values.cpu().numpy()
             returns, advantages = self.compute_returns_and_advantages(
-                rewards, is_terminals, old_values
+                memory.raw_rewards, memory.is_terminals, old_values_np
             )
 
-            # 미니배치 학습
-            total_policy_loss = 0
-            total_value_loss = 0
-            total_entropy = 0
-            
-            # 데이터셋 크기
-            dataset_size = len(states)
-            
-            # 미니배치 크기 설정
-            minibatch_size = min(BATCH_SIZE, dataset_size)
-            
-            # 미니배치 수 계산
-            n_minibatches = max(1, dataset_size // minibatch_size)
-            
-            # 학습 안정화를 위한 손실 임계값
-            max_value_loss = 2.0
-            max_policy_loss = 1.0
-            
-            # k_epochs만큼 반복 업데이트
-            for epoch in range(self.k_epochs):
-                # 데이터셋 인덱스 셔플
-                indices = torch.randperm(dataset_size)
+            if returns.numel() == 0 or advantages.numel() == 0:
+                self.logger.error("GAE 계산 실패로 PPO 업데이트 중단.")
+                return 0.0
+
+            adv_mean = advantages.mean()
+            adv_std = advantages.std()
+            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+
+            if torch.isnan(advantages).any() or torch.isinf(advantages).any():
+                self.logger.warning("Advantage 정규화 후 NaN/Inf 발견. 0으로 대체.")
+                advantages = torch.nan_to_num(advantages, nan=0.0)
+
+            for _ in range(self.k_epochs):
+                logprobs, entropy, state_values = self.policy.evaluate(old_states, old_actions)
+                ratios = torch.exp(logprobs - old_logprobs.detach())
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = self.MseLoss(state_values, returns)
+                entropy_loss = entropy.mean()
+                loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy_loss
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self.logger.error(f"손실 계산 중 NaN/Inf 발생! Actor: {actor_loss.item()}, Critic: {critic_loss.item()}, Entropy: {entropy_loss.item()}. 해당 배치 업데이트 건너뜁니다.")
+                    total_loss_val = 0.0
+                    break
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=GRADIENT_CLIP)
+                self.optimizer.step()
+                total_loss_val += loss.item()
                 
-                epoch_policy_loss = 0
-                epoch_value_loss = 0
-                epoch_entropy = 0
+                # 온도 파라미터 업데이트
+                self.policy.update_temperature()
                 
-                # 미니배치 반복
-                for start_idx in range(0, dataset_size, minibatch_size):
-                    # 미니배치 인덱스 선택
-                    end_idx = min(start_idx + minibatch_size, dataset_size)
-                    mb_indices = indices[start_idx:end_idx]
-                    
-                    # 미니배치 데이터 선택
-                    mb_states = states[mb_indices]
-                    mb_actions = actions[mb_indices]
-                    mb_old_log_probs = old_log_probs[mb_indices]
-                    mb_returns = returns[mb_indices]
-                    mb_advantages = advantages[mb_indices]
-                    
-                    # 현재 정책의 액션 확률과 가치 예측
-                    action_probs, values = self.policy(mb_states)
-                    values = values.squeeze()
-                    
-                    # 액션 분포 생성 및 액션 로그 확률 계산
-                    dist = torch.distributions.Categorical(action_probs)
-                    
-                    # 다차원 액션 처리용 인덱스 생성
-                    action_indices = torch.argmax(mb_actions, dim=1)
-                    
-                    # 현재 로그 확률 계산
-                    new_log_probs = dist.log_prob(action_indices)
-                    
-                    # 엔트로피 계산 (정책의 다양성 측정)
-                    entropy = dist.entropy().mean()
-                    
-                    # 정책 손실 계산 (PPO 목적 함수)
-                    ratio = torch.exp(new_log_probs - mb_old_log_probs)
-                    
-                    # 비율 클리핑 (NaN/Inf 방지)
-                    ratio = torch.clamp(ratio, 0.01, 10.0)
-                    
-                    surr1 = ratio * mb_advantages
-                    surr2 = torch.clamp(ratio, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * mb_advantages
-                    
-                    # PPO 클리핑 손실 (최소값 선택)
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # 가치 함수 손실 (MSE와 smooth L1 loss 조합)
-                    # MSE는 큰 오류에 민감, Smooth L1은 이상치에 덜 민감
-                    value_mse = self.MseLoss(values, mb_returns)
-                    value_smooth_l1 = F.smooth_l1_loss(values, mb_returns)
-                    value_loss = 0.5 * value_mse + 0.5 * value_smooth_l1
-                    
-                    # 손실 클리핑 (학습 안정화)
-                    if value_loss > max_value_loss:
-                        value_loss = torch.clamp(value_loss, 0, max_value_loss)
-                        
-                    if policy_loss > max_policy_loss:
-                        policy_loss = torch.clamp(policy_loss, 0, max_policy_loss)
-                    
-                    # 총 손실 = 정책 손실 + c1 * 가치 손실 - c2 * 엔트로피
-                    loss = policy_loss + CRITIC_COEF * value_loss - ENTROPY_COEF * entropy
-                    
-                    # 그래디언트 계산 및 업데이트
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    
-                    # 그래디언트 클리핑 적용 (안정화)
-                    if GRADIENT_CLIP > 0:
-                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), GRADIENT_CLIP)
-                    
-                    self.optimizer.step()
-                    
-                    # 통계 기록
-                    epoch_policy_loss += policy_loss.item()
-                    epoch_value_loss += value_loss.item()
-                    epoch_entropy += entropy.item()
-                
-                # 에폭 평균 손실 계산
-                avg_epoch_policy_loss = epoch_policy_loss / n_minibatches
-                avg_epoch_value_loss = epoch_value_loss / n_minibatches
-                avg_epoch_entropy = epoch_entropy / n_minibatches
-                
-                # 에폭별 손실 누적
-                total_policy_loss += avg_epoch_policy_loss
-                total_value_loss += avg_epoch_value_loss
-                total_entropy += avg_epoch_entropy
+                # EMA 모델 가중치 업데이트
+                if self.use_ema:
+                    self.update_ema_model()
                 
                 # KL 발산 조기 종료 (옵션) - 정책이 너무 크게 변경되는 것 방지
                 # 현재 에폭에서 평균 정책 손실이 크게 상승하면 업데이트 중단
-                if epoch > 0 and avg_epoch_policy_loss > 1.5 * (total_policy_loss / (epoch+1)):
-                    self.logger.debug(f"KL 발산 탐지: 에폭 {epoch+1}/{self.k_epochs}에서 업데이트 조기 종료")
+                if _ > 0 and actor_loss.item() > 1.5 * (total_loss_val / (_ + 1)):
+                    self.logger.debug(f"KL 발산 탐지: 에폭 {_+1}/{self.k_epochs}에서 업데이트 조기 종료")
                     break
 
-            # 이전 정책 업데이트 (정책 가중치 복사)
-            self.policy_old.load_state_dict(self.policy.state_dict())
-            
-            # EMA 모델 업데이트 (있는 경우)
-            if self.use_ema:
-                self.update_ema_model()
-            
-            # 업데이트당 평균 손실 계산
-            avg_policy_loss = total_policy_loss / (self.k_epochs * n_minibatches)
-            avg_value_loss = total_value_loss / (self.k_epochs * n_minibatches)
-            avg_entropy = total_entropy / (self.k_epochs * n_minibatches)
-            
-            self.logger.debug(
-                f"PPO 업데이트 완료: 정책 손실={avg_policy_loss:.6f}, "
-                f"가치 손실={avg_value_loss:.6f}, 엔트로피={avg_entropy:.6f}"
-            )
-            
-            # 메모리 사용 완료 후 정리
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            return avg_policy_loss
+            if total_loss_val != 0.0 or self.k_epochs == 0:
+                self.policy_old.load_state_dict(self.policy.state_dict())
+                return total_loss_val / max(1, self.k_epochs)
+            else:
+                return 0.0
+
         except Exception as e:
-            self.logger.error(f"PPO 업데이트 중 오류 발생: {e}")
+            self.logger.error(f"PPO 업데이트 중 예상치 못한 오류 발생: {e}")
             self.logger.error(traceback.format_exc())
-            return 0 
+            return 0.0 

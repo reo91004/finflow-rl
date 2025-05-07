@@ -166,9 +166,16 @@ def train_agent(
             raw_reward = info.get("raw_reward", reward)
             raw_rewards.append(raw_reward)
             
-            # 보상 일관성 유지: 원시 보상을 메모리에 저장 (정규화 안된 값)
-            # 이렇게 하면 PPO 업데이트에서 보상을 더 정확하게 반영할 수 있음
-            memory.add_experience(state, action, log_prob, raw_reward, terminated, value)
+            # 메모리에 경험 저장
+            memory.add_experience(
+                state=state, 
+                action=action, 
+                logprob=log_prob, 
+                reward=reward, 
+                is_terminal=terminated or truncated, 
+                value=value,
+                raw_reward=raw_reward  # 원시 보상 추가
+            )
             
             # 타임스텝 카운터 증가 및 PPO 업데이트 체크
             time_step += 1
@@ -309,7 +316,17 @@ def train_agent(
                         logger.warning(f"체크포인트 삭제 실패: {e}")
             
             logger.debug(f"체크포인트 저장: {checkpoint_path}")
-                
+            
+            # 학습 과정에서 최고 성능 기록 시 별도 저장
+            if current_episode_reward > best_train_reward:
+                best_train_reward = current_episode_reward
+                best_model_path = os.path.join(run_dir, "best_train_model.pth")
+                ppo_agent.save_model(episode, best_train_reward, best_model_path)
+                logger.info(f"학습 중 최고 성능 갱신! 에피소드: {episode}, 보상: {best_train_reward:.4f}")
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+        
     # 총 학습 시간 출력
     total_training_time = time.time() - training_start_time
     hours, remainder = divmod(total_training_time, 3600)
