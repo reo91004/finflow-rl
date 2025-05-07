@@ -154,11 +154,16 @@ class StockPortfolioEnv(gym.Env):
             return 0.0
 
         # 최근 수익률만 사용
-        recent_returns = (
+        recent_returns_raw = (
             self.returns_history[-window_size:]
             if len(self.returns_history) >= window_size
             else self.returns_history
         )
+        
+        # NaN 및 Inf 값 처리
+        recent_returns = [r for r in recent_returns_raw if np.isfinite(r)]
+        if len(recent_returns) < 2: # 유효한 데이터가 2개 미만이면 0 반환
+            return 0.0
 
         # 평균 수익률과 표준편차 계산
         mean_return = np.mean(recent_returns)

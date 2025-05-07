@@ -38,6 +38,7 @@ from src.constants import (
     ENTROPY_COEF,
     CRITIC_COEF
 )
+from src.models.running_mean_std import RunningMeanStd
 
 class PPO:
     """
@@ -281,9 +282,13 @@ class PPO:
             if self.use_ema:
                 checkpoint["ema_model_state_dict"] = self.policy_ema.state_dict()
 
-            # obs_rms 있으면 함께 저장
+            # obs_rms 있으면 함께 저장 (past.py 스타일)
             if self.obs_rms is not None:
-                checkpoint["obs_rms"] = self.obs_rms
+                checkpoint.update({
+                    'obs_rms_mean': self.obs_rms.mean,
+                    'obs_rms_var': self.obs_rms.var,
+                    'obs_rms_count': self.obs_rms.count,
+                })
 
             # 파일 저장
             torch.save(checkpoint, save_file)
@@ -323,9 +328,24 @@ class PPO:
             if "optimizer_state_dict" in checkpoint:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-            # 관측 정규화 통계 불러오기 (있는 경우)
-            if "obs_rms" in checkpoint:
-                self.obs_rms = checkpoint["obs_rms"]
+            # 관측 정규화 통계 불러오기 (past.py 스타일)
+            if 'obs_rms_mean' in checkpoint and 'obs_rms_var' in checkpoint and 'obs_rms_count' in checkpoint:
+                if self.obs_rms is None:
+                    # self.obs_rms = RunningMeanStd(shape=(self.n_assets, self.n_features)) # 여기서 shape을 알아야 함.
+                    # n_features는 __init__에서 받고, n_assets도 받음.
+                    # RunningMeanStd는 actor_critic 내부가 아니라 env에 있어야 함.
+                    # 환경의 obs_rms를 PPO가 참조하거나, PPO가 직접 관리한다면 shape 정보 필요.
+                    # past.py에서는 PPO가 obs_rms를 직접 관리했음.
+                    # 여기서는 PPO.__init__에서 self.n_assets, self.n_features를 알고 있으므로 사용 가능.
+                    self.obs_rms = RunningMeanStd(shape=(self.n_assets, self.n_features))
+                self.obs_rms.mean = checkpoint['obs_rms_mean']
+                self.obs_rms.var = checkpoint['obs_rms_var']
+                self.obs_rms.count = checkpoint['obs_rms_count']
+                self.logger.info("저장된 상태 정규화(obs_rms) 통계 로드 완료.")
+            else:
+                # obs_rms 정보가 없는 경우, None으로 유지하거나 새로 생성하지 않음.
+                # 학습 시작 시 환경에서 obs_rms를 가져오거나, 새로 생성해야 함.
+                self.obs_rms = None # 명시적으로 None 처리
 
             self.best_reward = checkpoint.get("best_reward", self.best_reward)
             episode = checkpoint.get("episode", 0)
@@ -416,10 +436,10 @@ class PPO:
             self.logger.warning("업데이트 시도: 메모리가 비어있습니다.")
             return 0.0
 
-        total_loss = 0.0
-        total_actor_loss = 0.0
-        total_critic_loss = 0.0
-        total_entropy = 0.0
+        total_loss_val = 0.0 # total_loss_val 초기화
+        # total_actor_loss = 0.0 # 이 변수들은 현재 사용되지 않으므로 주석 처리 또는 삭제 가능
+        # total_critic_loss = 0.0
+        # total_entropy = 0.0
         
         try:
             # 1. 메모리에서 데이터 로드
@@ -450,108 +470,63 @@ class PPO:
                 self.logger.warning("Advantage 정규화 후 NaN/Inf 발견. 0으로 대체.")
                 advantages = torch.nan_to_num(advantages, nan=0.0)
 
-            # 4. 미니배치 학습 (메모리 크기에 따라 배치 수 조정)
-            batch_size = min(BATCH_SIZE, len(memory.states))
-            n_batches = len(memory.states) // batch_size
-            
-            # 각 에포크별 손실 추적
-            epoch_losses = []
-            
+            # PPO 업데이트 루프
             for _ in range(self.k_epochs):
-                # 데이터 인덱스를 셔플하여 다양한 배치 구성
-                indices = torch.randperm(len(memory.states))
-                epoch_loss = 0.0
-                epoch_actor_loss = 0.0
-                epoch_critic_loss = 0.0
-                epoch_entropy = 0.0
+                logprobs, entropy, state_values = self.policy.evaluate(
+                    old_states, old_actions
+                )
+                ratios = torch.exp(logprobs - old_logprobs.detach())
                 
-                # 미니배치 단위로 처리
-                for i in range(n_batches):
-                    batch_indices = indices[i * batch_size:(i + 1) * batch_size]
-                    
-                    # 미니배치 데이터 추출
-                    states_batch = old_states[batch_indices]
-                    actions_batch = old_actions[batch_indices]
-                    logprobs_batch = old_logprobs[batch_indices]
-                    advantages_batch = advantages[batch_indices]
-                    returns_batch = returns[batch_indices]
-                    
-                    # 현재 정책으로 배치 평가
-                    batch_logprobs, batch_entropy, batch_state_values = self.policy.evaluate(
-                        states_batch, actions_batch
+                # Surrogate 손실 계산
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                
+                # 액터, 크리틱, 엔트로피 손실 계산 (past.py 스타일 계수 적용)
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = self.MseLoss(state_values, returns) # MSELoss는 __init__에서 정의됨
+                entropy_loss = entropy.mean()
+                
+                # 총 손실
+                # loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy_loss
+                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy_loss # past.py 계수 직접 사용
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self.logger.error(
+                        f"손실 계산 중 NaN/Inf 발생! Actor: {actor_loss.item()}, "
+                        f"Critic: {critic_loss.item()}, Entropy: {entropy_loss.item()}. "
+                        f"해당 배치 업데이트 건너<0xEB><0x9A><0x8D>니다."
                     )
-                    
-                    # PPO 비율 계산
-                    ratios = torch.exp(batch_logprobs - logprobs_batch.detach())
-                    
-                    # PPO 손실 계산 (클리핑 적용)
-                    surr1 = ratios * advantages_batch
-                    surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages_batch
-                    actor_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # 가치 손실 계산 (Huber Loss 또는 MSE)
-                    # state_values와 returns의 shape 맞추기
-                    batch_state_values = batch_state_values.reshape(-1)  # [batch_size, 1] -> [batch_size]
-                    
-                    # Huber Loss와 MSE 손실 결합 - 이상치에 더 강건함
-                    critic_loss_mse = self.MseLoss(batch_state_values, returns_batch)
-                    critic_loss_huber = F.smooth_l1_loss(batch_state_values, returns_batch)
-                    critic_loss = 0.5 * critic_loss_mse + 0.5 * critic_loss_huber
-                    
-                    # 엔트로피 보너스 (탐색 촉진)
-                    entropy_loss = batch_entropy.mean()
-                    
-                    # 최종 손실 계산
-                    loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy_loss
-                    
-                    # 손실 체크 (NaN/Inf 방지)
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        self.logger.warning(f"배치 {i}에서 NaN/Inf 손실 발생. 해당 배치 건너뜁니다.")
-                        continue
-                    
-                    # 옵티마이저 업데이트
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    
-                    # 그래디언트 클리핑 (안정성 증가)
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=GRADIENT_CLIP)
-                    
-                    self.optimizer.step()
-                    
-                    # 손실 누적
-                    epoch_loss += loss.item()
-                    epoch_actor_loss += actor_loss.item()
-                    epoch_critic_loss += critic_loss.item()
-                    epoch_entropy += entropy_loss.item()
-                    
-                # 에포크별 평균 손실 계산 (유효 배치 수로 나눔)
-                if n_batches > 0:
-                    epoch_losses.append(epoch_loss / n_batches)
-                    total_actor_loss += epoch_actor_loss / n_batches
-                    total_critic_loss += epoch_critic_loss / n_batches
-                    total_entropy += epoch_entropy / n_batches
-                    
-                # 온도 파라미터 업데이트
-                self.policy.update_temperature()
+                    total_loss_val = 0.0 # 에러 시 이전 손실 누적 방지
+                    break  # 현재 배치 업데이트 중단
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                # torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=GRADIENT_CLIP)
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5) # past.py max_norm 직접 사용
+                self.optimizer.step()
                 
+                # 온도 파라미터 업데이트 (past.py와 동일하게 epoch 루프 내 위치)
+                self.policy.update_temperature()
+
                 # EMA 모델 가중치 업데이트
                 if self.use_ema:
                     self.update_ema_model()
                 
-                # KL 발산 조기 종료 - 정책이 너무 크게 변경되는 것 방지
-                if len(epoch_losses) >= 2 and epoch_losses[-1] > 1.5 * epoch_losses[-2]:
-                    self.logger.debug(f"KL 발산 탐지: 에폭 {_+1}/{self.k_epochs}에서 업데이트 조기 종료")
-                    break
-            
-            # 이전 정책 업데이트
-            self.policy_old.load_state_dict(self.policy.state_dict())
-            
-            # 로깅을 위한 손실 평균값 계산
-            if epoch_losses:
-                total_loss = sum(epoch_losses) / len(epoch_losses)
-                self.logger.debug(f"PPO 업데이트 완료: 손실={total_loss:.4f}, 액터={total_actor_loss/self.k_epochs:.4f}, 크리틱={total_critic_loss/self.k_epochs:.4f}, 엔트로피={total_entropy/self.k_epochs:.4f}")
+                total_loss_val += loss.item()
                 
-            return total_loss
+            # 가비지 컬렉션 (메모리 관리 강화)
+            # gc.collect()
+            # if DEVICE.type == 'cuda':
+            #     torch.cuda.empty_cache()
+
+
+            # 이전 정책 업데이트
+            if total_loss_val != 0.0 or self.k_epochs == 0: # 손실이 0이 아니거나 에폭이 0일 때만 업데이트
+                self.policy_old.load_state_dict(self.policy.state_dict())
+                # 평균 손실 반환
+                return total_loss_val / self.k_epochs if self.k_epochs > 0 else 0.0
+            else: # 손실이 0이면 (예: NaN 발생으로 업데이트 건너뛴 경우) 0.0 반환
+                return 0.0
 
         except Exception as e:
             self.logger.error(f"PPO 업데이트 중 예상치 못한 오류 발생: {e}")
