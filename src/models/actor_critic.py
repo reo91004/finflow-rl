@@ -59,74 +59,51 @@ class ActorCritic(nn.Module):
     """
 
     def __init__(self, n_assets, n_features, hidden_dim=DEFAULT_HIDDEN_DIM):
+        """
+        Actor-Critic 모델 초기화.
+
+        Args:
+            n_assets (int): 자산(주식) 수.
+            n_features (int): 각 자산당 피처 수.
+            hidden_dim (int, optional): 은닉층 크기.
+        """
         super(ActorCritic, self).__init__()
-        self.input_dim = n_assets * n_features
-        self.n_assets = n_assets + 1  # 현금 자산 추가
+        self.n_assets = n_assets
         self.n_features = n_features
         self.hidden_dim = hidden_dim
 
-        # 온도 파라미터 (학습 가능)
-        self.temperature = nn.Parameter(torch.tensor(SOFTMAX_TEMPERATURE_INITIAL))
+        # 온도 파라미터: 정책 결정성을 제어하는 하이퍼파라미터
+        # 낮은 온도 = 확률 분포가 더 결정적(spiky), 높은 온도 = 확률 분포가 더 균등
+        self.temperature = SOFTMAX_TEMPERATURE_INITIAL
         self.temp_min = SOFTMAX_TEMPERATURE_MIN
         self.temp_decay = SOFTMAX_TEMPERATURE_DECAY
 
-        # 다층 LSTM 레이어 (시계열 패턴 포착 강화)
-        self.lstm_layers = 2  # LSTM 레이어 수 증가 (1 -> 2)
+        # 1. 특성 추출 모듈 (LSTM 기반)
         self.lstm = nn.LSTM(
-            input_size=n_features, 
-            hidden_size=hidden_dim,
-            num_layers=self.lstm_layers,
-            batch_first=True,
-            dropout=0.2,  # 드롭아웃 추가로 과적합 방지
-            bidirectional=True  # 양방향 LSTM으로 성능 향상
-        ).to(DEVICE)
+            input_size=n_features,  # 입력 특성 수
+            hidden_size=hidden_dim,  # 은닉층 크기
+            num_layers=1,  # 단일 레이어 LSTM
+            batch_first=False,  # (seq_len, batch, features) 형식 
+        )
         
-        # 양방향 LSTM이므로 출력 차원이 2배
-        self.lstm_output_dim = hidden_dim * 2
+        # 2. 자기 주의 메커니즘 (에셋 간 관계 학습)
+        self.self_attention = SelfAttention(hidden_dim)
         
-        # 자기 주의(Self-Attention) 메커니즘 추가
-        self.attention = SelfAttention(self.lstm_output_dim).to(DEVICE)
+        # 3. 액터 네트워크 (정책 생성)
+        # 입력 -> 복층 MLP -> 출력 구조 (표현력 강화)
+        self.actor_layer1 = nn.Linear(hidden_dim, hidden_dim)
+        self.actor_layer2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        # 최종 출력 레이어 (n_assets+1: 현금 포함)
+        self.actor_head = nn.Linear(hidden_dim // 2, 1)
         
-        # 자산별 특징 압축 레이어
-        self.asset_compression = nn.Sequential(
-            nn.Linear(self.lstm_output_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),  # 배치 정규화 추가
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        ).to(DEVICE)
-
-        # 공통 특징 추출 레이어 (더 깊고 넓게)
-        self.actor_critic_base = nn.Sequential(
-            nn.Linear(hidden_dim * n_assets, hidden_dim * 2),  # 더 넓은 레이어
-            nn.BatchNorm1d(hidden_dim * 2),  # 배치 정규화로 변경
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),  # 배치 정규화로 변경
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),  # 배치 정규화로 변경
-            nn.ReLU(),
-        ).to(DEVICE)
-
-        # 액터 헤드 (로짓 출력)
-        self.actor_head = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),  # 배치 정규화 추가
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, self.n_assets)
-        ).to(DEVICE)
-
-        # 크리틱 헤드 (상태 가치)
-        self.critic_head = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.BatchNorm1d(hidden_dim // 4),  # 배치 정규화 추가
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 4, 1)
-        ).to(DEVICE)
-
-        # 가중치 초기화 적용
+        # 드롭아웃 추가 (과적합 방지)
+        self.dropout = nn.Dropout(0.2)
+        
+        # 4. 크리틱 네트워크 (가치 추정)
+        # 모든 자산 정보를 통합하여 포트폴리오 가치 평가
+        self.critic_head = nn.Linear(n_assets * hidden_dim, 1)
+        
+        # 가중치 초기화
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -178,60 +155,62 @@ class ActorCritic(nn.Module):
         # NaN/Inf 입력 방지 (안정성 강화)
         if torch.isnan(states).any() or torch.isinf(states).any():
             # logger.warning(f"ActorCritic 입력에 NaN/Inf 발견. 0으로 대체합니다. Shape: {states.shape}")
-            states = torch.nan_to_num(states, nan=0.0, posinf=0.0, neginf=0.0)
+            states = torch.nan_to_num(states, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # LSTM 처리 및 어텐션 적용
-        lstm_outputs = []
+        # Feature Extraction: LSTM 통과
+        # LSTM에서는 (seq_len, batch, input_size) 형태 필요
+        # LSTM_input: (n_assets, batch_size, n_features)
+        states_permuted = states.permute(1, 0, 2).contiguous()
         
-        # 각 자산별로 피처 시퀀스를 LSTM에 통과시킴
-        for i in range(states.size(1)):
-            # (batch_size, 1, n_features) 형태로 재구성
-            asset_feats = states[:, i, :].view(batch_size, 1, -1)
-            
-            # LSTM으로 처리
-            # (batch, 1, lstm_output_dim)
-            lstm_out, _ = self.lstm(asset_feats)
-            
-            # 어텐션 메커니즘 적용
-            # (batch, 1, lstm_output_dim)
-            context, _ = self.attention(lstm_out)
-            
-            # 마지막 시퀀스 출력 추출 (batch, lstm_output_dim)
-            asset_out = context[:, -1, :]
-            
-            # 자산별 특징 압축 (배치 정규화를 위해 차원 변경)
-            asset_out_flattened = asset_out.reshape(batch_size, -1)
-            compressed = self.asset_compression(asset_out_flattened)
-            
-            lstm_outputs.append(compressed)
+        # 초기 히든 스테이트와 셀 스테이트는 기본값으로 사용
+        lstm_out, (h_n, c_n) = self.lstm(states_permuted)
+        
+        # LSTM 출력: (n_assets, batch_size, hidden_dim)
+        # 마지막 출력값 추출: (batch_size, n_assets, hidden_dim)
+        lstm_features = lstm_out.permute(1, 0, 2).contiguous()
 
-        # 모든 자산의 특징을 연결
-        lstm_concat = torch.cat(lstm_outputs, dim=1)  # (batch, n_assets*hidden_dim)
-        lstm_flat = lstm_concat.reshape(batch_size, -1)  # 평탄화
+        # 자기주의 메커니즘 적용 (에셋 간 관계 모델링)
+        if hasattr(self, 'self_attention'):
+            # 자기주의 메커니즘 적용 (차원 맞추기)
+            # self_attention 입력: (batch_size, seq_len, hidden_dim) = (batch_size, n_assets, hidden_dim)
+            attention_out = self.self_attention(lstm_features)
+            features = attention_out
+        else:
+            features = lstm_features
 
-        # 공통 베이스 네트워크 통과
-        base_output = self.actor_critic_base(lstm_flat)
-
-        # 액터 출력: 로짓 계산
-        logits = self.actor_head(base_output)
-
-        # 온도 스케일링 적용 (낮은 온도 = 더 높은 분산)
-        # 온도가 낮을수록 확률 분포는 더 극단적으로 변환됨 (Sparsity 유도)
-        scaled_logits = logits / (self.temperature + 1e-8)
-
-        # Softmax로 확률 분포 계산
-        action_probs = F.softmax(scaled_logits, dim=-1)
-
-        # 수치적 안정성을 위한 클리핑
-        action_probs = torch.clamp(action_probs, min=1e-7, max=1.0)
-
-        # 확률 합이 1이 되도록 정규화
-        action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
-
-        # 크리틱 출력: 상태 가치
-        value = self.critic_head(base_output)
-
-        return action_probs, value
+        # 가치 네트워크 (Critic) - LSTM 유지하여 변경 없음
+        # 전체 특성을 평탄화하여 가치 함수 추정
+        # 모든 자산의 정보를 통합하여 포트폴리오 가치 평가
+        value_features = features.reshape(batch_size, -1)  # (batch_size, n_assets * hidden_dim)
+        
+        # 가치 헤드 통과
+        value = self.critic_head(value_features)  # (batch_size, 1)
+        
+        # 정책 네트워크 (Actor) 개선 - 복잡성 증가
+        # 추가 레이어를 통한 정책 표현력 강화
+        policy_features = features  # (batch_size, n_assets, hidden_dim)
+        
+        # 차원 축소 레이어 (정보 압축)
+        x = F.leaky_relu(self.actor_layer1(policy_features))
+        # 드롭아웃 적용 (과적합 방지)
+        x = self.dropout(x)
+        # 두 번째 레이어 통과
+        x = F.leaky_relu(self.actor_layer2(x))
+        
+        # 각 자산에 대한 로짓 값 계산
+        logits = self.actor_head(x).squeeze(-1)  # (batch_size, n_assets)
+        
+        # 온도 조절된 소프트맥스 활성화 함수로 확률 변환
+        # 온도 파라미터가 낮을수록 더 결정적인(deterministic) 정책 생성
+        # (batch_size, n_assets+1) - 현금 포함
+        action_probs = F.softmax(logits / self.temperature, dim=-1)
+        
+        # 발산 방지를 위한 안전장치
+        if torch.isnan(action_probs).any():
+            # NaN 발생 시 균등 분포로 대체
+            action_probs = torch.ones_like(action_probs) / action_probs.size(-1)
+        
+        return action_probs, value.squeeze(-1)
 
     def act(self, state):
         """
@@ -286,7 +265,7 @@ class ActorCritic(nn.Module):
             return (
                 action.squeeze(0).cpu().numpy(),
                 log_prob.item(),
-                state_value.squeeze().item()
+                state_value.item()
             )
 
     def evaluate(self, states, actions):
@@ -302,7 +281,7 @@ class ActorCritic(nn.Module):
             tuple: (log_probs, entropy, state_values)
                    - log_probs (torch.Tensor): 액션의 로그 확률.
                    - entropy (torch.Tensor): 정책의 엔트로피.
-                   - state_values (torch.Tensor): 상태 가치.
+                   - state_values (torch.Tensor): 상태 가치 [batch_size] 형태.
         """
         # 정책과 가치 함수 출력
         action_probs, state_values = self.forward(states)

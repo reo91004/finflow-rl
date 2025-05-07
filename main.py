@@ -262,7 +262,7 @@ def train_mode(args, train_data, test_data, train_dates, test_dates, logger):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.results_dir = os.path.join(RESULTS_BASE_PATH, f"finflow_all_{timestamp}")
         os.makedirs(args.results_dir, exist_ok=True)
-        
+    
         # 명시적으로 체크포인트 디렉토리 생성
         checkpoint_dir = os.path.join(args.results_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)

@@ -440,32 +440,57 @@ class StockPortfolioEnv(gym.Env):
             # K일치 데이터가 없으면 일간 수익률 사용
             k_day_return = daily_return
         
-        # 2. Sharpe ratio 계산
-        sharpe_ratio = self._calculate_sharpe_ratio()
+        # 2. Sharpe ratio 계산 (더 짧은 윈도우 사용)
+        sharpe_ratio = self._calculate_sharpe_ratio(window_size=10)  # 더 민감하게 반응
         
-        # 3. 드로우다운 페널티 계산
+        # 3. 드로우다운 페널티 계산 (비선형 페널티 적용)
         drawdown = self._calculate_drawdown()
-        drawdown_penalty = REWARD_DRAWDOWN_PENALTY * drawdown
+        # 드로우다운이 커질수록 페널티 증가 (제곱)
+        drawdown_penalty = REWARD_DRAWDOWN_PENALTY * (drawdown ** 2)
         
-        # 4. 최종 보상 계산 (가중 합)
-        # 변동성 스케일링 적용 (높은 변동성 = 낮은 클리핑)
-        scaled_return = k_day_return * self.volatility_scaling
+        # 4. 행동 변화 페널티 (L2 거리로 변경하여 급격한 변화에 더 큰 패널티)
+        action_penalty = self.action_penalty_coef * np.sum((action - self.prev_weights)**2)
         
-        # 수익률 기여도 (tanh로 비선형 클리핑)
-        return_component = np.tanh(scaled_return) * REWARD_RETURN_WEIGHT
+        # 5. 안정적인 자산 배분에 대한 보너스 (중간 정도의 위험 선호)
+        # 현금을 너무 많이 들고 있거나 한 자산에 너무 집중하는 것을 방지
+        cash_ratio = self.weights[-1]  # 현금 비중
+        max_asset_ratio = np.max(self.weights[:-1]) if self.weights[:-1].size > 0 else 0
+        concentration_penalty = 0.05 * (max_asset_ratio > 0.5) + 0.05 * (cash_ratio > 0.7)
         
-        # Sharpe ratio 기여도 (-1~1 범위로 클리핑)
-        sharpe_component = np.clip(sharpe_ratio / 3.0, -1, 1) * REWARD_SHARPE_WEIGHT
+        # 6. 최종 보상 계산 (논문 기반 비선형 변환)
+        # 로그 수익률을 사용하여 상대적 변화에 더 민감하게 반응
+        # 양수 수익률과 음수 수익률에 비대칭적 가중치 적용
+        if k_day_return > 0:
+            # 양수 수익률: 로그 변환을 통해 큰 수익에 대한 한계 효용 감소
+            return_component = np.log(1 + k_day_return * 5) * REWARD_RETURN_WEIGHT
+        else:
+            # 음수 수익률: 손실에 더 민감하게 반응
+            return_component = -np.log(1 - k_day_return * 5) * REWARD_RETURN_WEIGHT * 1.2
         
-        # 최종 보상 계산
-        raw_reward = return_component + sharpe_component - drawdown_penalty - action_change_penalty
+        # Sharpe ratio 기여도 (비선형 변환)
+        sharpe_component = np.tanh(sharpe_ratio / 2.0) * REWARD_SHARPE_WEIGHT
+        
+        # 최종 보상 계산 (각 요소 합산)
+        raw_reward = (
+            return_component + 
+            sharpe_component - 
+            drawdown_penalty - 
+            action_penalty - 
+            concentration_penalty
+        )
+        
+        # 매우 높은 수익률 또는 심각한 손실에 대한 추가 보상/페널티
+        if k_day_return > 0.1:  # 10% 이상 수익
+            raw_reward += 0.3  # 추가 보너스
+        elif k_day_return < -0.1:  # 10% 이상 손실
+            raw_reward -= 0.5  # 추가 페널티
         
         # NaN/Inf 처리
         if np.isnan(raw_reward) or np.isinf(raw_reward):
-            raw_reward = -1.0 # NaN/Inf 발생 시 페널티
+            raw_reward = -1.5  # NaN/Inf 발생 시 페널티
         
-        # 보상 클리핑 적용 (tanh 함수로 비선형 클리핑)
-        raw_reward = np.tanh(raw_reward) * 2.0  # -2.0~2.0 범위로 비선형 클리핑
+        # 보상 클리핑 (제한된 범위 내로 비선형 변환)
+        raw_reward = 2.0 * np.tanh(raw_reward / 2.0)  # -2.0~2.0 범위로 비선형 클리핑
         
         # 다음 상태 및 보상 정규화
         next_obs_norm = self._normalize_obs(next_obs_raw)
@@ -479,7 +504,7 @@ class StockPortfolioEnv(gym.Env):
             "weights": self.weights.copy(),
             "return": daily_return,
             "raw_reward": raw_reward,  # 원시 보상 전달 (정규화 안된 값)
-            "action_penalty": action_change_penalty,
+            "action_penalty": action_penalty,
             "k_day_return": k_day_return if 'k_day_return' in locals() else 0.0,
             "sharpe_ratio": sharpe_ratio,
             "drawdown": drawdown,

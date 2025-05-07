@@ -300,7 +300,6 @@ def train_agent(
                 break
         
         # 매 20 에피소드마다 체크포인트 저장 (복구용)
-        # 기존 10 에피소드보다 덜 빈번하게 저장하고 체크포인트 디렉토리에 정리해서 저장
         if episode % 20 == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f"model_ep{episode}.pth")
             ppo_agent.save_model(episode, current_episode_reward, checkpoint_path)
@@ -317,15 +316,8 @@ def train_agent(
             
             logger.debug(f"체크포인트 저장: {checkpoint_path}")
             
-            # 학습 과정에서 최고 성능 기록 시 별도 저장
-            if current_episode_reward > best_train_reward:
-                best_train_reward = current_episode_reward
-                best_model_path = os.path.join(run_dir, "best_train_model.pth")
-                ppo_agent.save_model(episode, best_train_reward, best_model_path)
-                logger.info(f"학습 중 최고 성능 갱신! 에피소드: {episode}, 보상: {best_train_reward:.4f}")
-                no_improvement_count = 0
-            else:
-                no_improvement_count += 1
+            # best_train_model 저장 로직 제거 - 검증 기반 모델 저장만 사용
+            no_improvement_count += 1
         
     # 총 학습 시간 출력
     total_training_time = time.time() - training_start_time

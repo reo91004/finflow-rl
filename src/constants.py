@@ -70,31 +70,31 @@ SOFTMAX_TEMPERATURE_DECAY = 0.999
 REWARD_ACCUMULATION_DAYS = 5
 
 # 보상 함수 관련 설정
-REWARD_SHARPE_WINDOW = 15  # Sharpe ratio 계산 윈도우
-REWARD_RETURN_WEIGHT = 0.8  # 수익률 가중치 (0.7→0.8)
-REWARD_SHARPE_WEIGHT = 0.2  # Sharpe ratio 가중치 (0.3→0.2)
-REWARD_DRAWDOWN_PENALTY = 0.1  # 드로우다운 페널티 계수 (0.2→0.1)
-REWARD_VOL_SCALE_MIN = 0.9  # 변동성 기반 클리핑 최소값
-REWARD_VOL_SCALE_MAX = 1.1  # 변동성 기반 클리핑 최대값
-REWARD_LONG_TERM_BONUS = 0.05  # 장기 보상 보너스 계수
-REWARD_NEGATIVE_WEIGHT = 1.05  # 음수 보상 가중치
-# 새로운 보상 클리핑 범위 추가
-REWARD_CLIP_MIN = -2.0  # 보상 클리핑 최소값 (-5.0→-2.0)
-REWARD_CLIP_MAX = 2.0  # 보상 클리핑 최대값 (5.0→2.0)
+REWARD_SHARPE_WINDOW = 10  # Sharpe ratio 계산 윈도우 (15→10)
+REWARD_RETURN_WEIGHT = 0.75  # 수익률 가중치 (0.8→0.75)
+REWARD_SHARPE_WEIGHT = 0.25  # Sharpe ratio 가중치 (0.2→0.25)
+REWARD_DRAWDOWN_PENALTY = 0.15  # 드로우다운 페널티 계수 (0.1→0.15)
+REWARD_VOL_SCALE_MIN = 0.85  # 변동성 기반 클리핑 최소값 (0.9→0.85)
+REWARD_VOL_SCALE_MAX = 1.15  # 변동성 기반 클리핑 최대값 (1.1→1.15)
+REWARD_LONG_TERM_BONUS = 0.1  # 장기 보상 보너스 계수 (0.05→0.1)
+REWARD_NEGATIVE_WEIGHT = 1.2  # 음수 보상 가중치 (1.05→1.2)
+# 새로운 보상 클리핑 범위
+REWARD_CLIP_MIN = -2.0  # 보상 클리핑 최소값
+REWARD_CLIP_MAX = 2.0  # 보상 클리핑 최대값
 # Sharpe ratio 클리핑 값 수정
-SHARPE_RATIO_CLIP = 3.0
+SHARPE_RATIO_CLIP = 2.5  # (3.0→2.5)
 
 # PPO 하이퍼파라미터 (기본값)
 DEFAULT_HIDDEN_DIM = 256  # 모델 크기
-DEFAULT_LR = 3e-5  # 학습률 (2e-5→3e-5)
-DEFAULT_GAMMA = 0.99  # 할인율 (0.95→0.99)
-DEFAULT_K_EPOCHS = 4  # PPO 에폭 수
-DEFAULT_EPS_CLIP = 0.15  # PPO 클리핑 파라미터 (0.2→0.15)
-PPO_UPDATE_TIMESTEP = 500  # PPO 업데이트 주기
-BATCH_SIZE = 64  # 배치 사이즈 (128→64)
-GRADIENT_CLIP = 0.7  # 그래디언트 클리핑 값 (0.5→0.7)
-ENTROPY_COEF = 0.02  # 엔트로피 보너스 계수 (0.01→0.02)
-CRITIC_COEF = 0.7  # 크리틱 계수
+DEFAULT_LR = 4e-5  # 학습률 (3e-5→4e-5)
+DEFAULT_GAMMA = 0.99  # 할인율
+DEFAULT_K_EPOCHS = 5  # PPO 에폭 수 (4→5)
+DEFAULT_EPS_CLIP = 0.2  # PPO 클리핑 파라미터 (0.15→0.2)
+PPO_UPDATE_TIMESTEP = 400  # PPO 업데이트 주기 (500→400)
+BATCH_SIZE = 64  # 배치 사이즈
+GRADIENT_CLIP = 0.75  # 그래디언트 클리핑 값 (0.7→0.75)
+ENTROPY_COEF = 0.03  # 엔트로피 보너스 계수 (0.02→0.03)
+CRITIC_COEF = 0.8  # 크리틱 계수 (0.7→0.8)
 
 # 환경 설정
 MAX_EPISODE_LENGTH = 504  # 환경의 최대 에피소드 길이
