@@ -74,7 +74,7 @@ class ActorCritic(nn.Module):
 
         # 온도 파라미터: 정책 결정성을 제어하는 하이퍼파라미터
         # 낮은 온도 = 확률 분포가 더 결정적(spiky), 높은 온도 = 확률 분포가 더 균등
-        self.temperature = SOFTMAX_TEMPERATURE_INITIAL
+        self.temperature = torch.tensor(SOFTMAX_TEMPERATURE_INITIAL, dtype=torch.float32, device=DEVICE, requires_grad=False)
         self.temp_min = SOFTMAX_TEMPERATURE_MIN
         self.temp_decay = SOFTMAX_TEMPERATURE_DECAY
 
@@ -93,8 +93,8 @@ class ActorCritic(nn.Module):
         # 입력 -> 복층 MLP -> 출력 구조 (표현력 강화)
         self.actor_layer1 = nn.Linear(hidden_dim, hidden_dim)
         self.actor_layer2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        # 최종 출력 레이어 (n_assets+1: 현금 포함)
-        self.actor_head = nn.Linear(hidden_dim // 2, 1)
+        # 최종 출력 레이어: 각 자산별 처리 후 나온 feature들을 flatten하여 n_assets+1 (현금포함)개의 logit 생성
+        self.actor_head = nn.Linear(self.n_assets * (hidden_dim // 2), self.n_assets + 1)
         
         # 드롭아웃 추가 (과적합 방지)
         self.dropout = nn.Dropout(0.2)
@@ -131,7 +131,8 @@ class ActorCritic(nn.Module):
         """학습 과정에서 온도 값을 점진적으로 감소시킵니다."""
         with torch.no_grad():
             # 최소값보다 작아지지 않도록 조정
-            self.temperature.mul_(self.temp_decay).clamp_(min=self.temp_min)
+            self.temperature.mul_(self.temp_decay)
+            self.temperature.clamp_(min=self.temp_min)
 
     def forward(self, states):
         """
@@ -173,7 +174,7 @@ class ActorCritic(nn.Module):
         if hasattr(self, 'self_attention'):
             # 자기주의 메커니즘 적용 (차원 맞추기)
             # self_attention 입력: (batch_size, seq_len, hidden_dim) = (batch_size, n_assets, hidden_dim)
-            attention_out = self.self_attention(lstm_features)
+            attention_out, _ = self.self_attention(lstm_features)  # context만 사용
             features = attention_out
         else:
             features = lstm_features
@@ -190,18 +191,18 @@ class ActorCritic(nn.Module):
         # 추가 레이어를 통한 정책 표현력 강화
         policy_features = features  # (batch_size, n_assets, hidden_dim)
         
-        # 차원 축소 레이어 (정보 압축)
+        # 차원 축소 레이어 (정보 압축) - 각 자산별로 적용
         x = F.leaky_relu(self.actor_layer1(policy_features))
         # 드롭아웃 적용 (과적합 방지)
         x = self.dropout(x)
-        # 두 번째 레이어 통과
-        x = F.leaky_relu(self.actor_layer2(x))
+        # 두 번째 레이어 통과 - 각 자산별로 적용
+        x = F.leaky_relu(self.actor_layer2(x))  # (batch_size, n_assets, hidden_dim // 2)
         
-        # 각 자산에 대한 로짓 값 계산
-        logits = self.actor_head(x).squeeze(-1)  # (batch_size, n_assets)
+        # 모든 자산의 정제된 특성을 flatten하여 최종 로짓 계산
+        x_flat = x.reshape(batch_size, -1)  # (batch_size, n_assets * (hidden_dim // 2))
+        logits = self.actor_head(x_flat)  # (batch_size, n_assets + 1)
         
         # 온도 조절된 소프트맥스 활성화 함수로 확률 변환
-        # 온도 파라미터가 낮을수록 더 결정적인(deterministic) 정책 생성
         # (batch_size, n_assets+1) - 현금 포함
         action_probs = F.softmax(logits / self.temperature, dim=-1)
         
