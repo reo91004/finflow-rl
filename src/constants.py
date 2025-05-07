@@ -56,7 +56,7 @@ TRAIN_TEST_SPLIT_RATIO = 0.8  # 학습/테스트 데이터 분할 비율
 INITIAL_CASH = 1e6
 COMMISSION_RATE = 0.0005  # 수수료 현실화 (0.005 → 0.0005)
 # 새로운 매개변수: 행동 변화 페널티 계수
-ACTION_PENALTY_COEF = 0.001
+ACTION_PENALTY_COEF = 0.01
 
 # 새로운 행동 스케일링 계수
 DIRICHLET_SCALE_FACTOR = 10.0
@@ -70,40 +70,40 @@ SOFTMAX_TEMPERATURE_DECAY = 0.999
 REWARD_ACCUMULATION_DAYS = 5
 
 # 보상 함수 관련 설정
-REWARD_SHARPE_WINDOW = 20  # Sharpe ratio 계산 윈도우
-REWARD_RETURN_WEIGHT = 0.7  # 수익률 가중치
-REWARD_SHARPE_WEIGHT = 0.3  # Sharpe ratio 가중치
-REWARD_DRAWDOWN_PENALTY = 0.2  # 드로우다운 페널티 계수
-REWARD_VOL_SCALE_MIN = 0.8  # 변동성 기반 클리핑 최소값 (0.5 → 0.8)
-REWARD_VOL_SCALE_MAX = 1.2  # 변동성 기반 클리핑 최대값 (2.0 → 1.2)
-REWARD_LONG_TERM_BONUS = 0.1  # 장기 보상 보너스 계수 (0.3 → 0.1)
-REWARD_NEGATIVE_WEIGHT = 1.1  # 음수 보상 가중치 (1.2 → 1.1)
+REWARD_SHARPE_WINDOW = 15  # Sharpe ratio 계산 윈도우
+REWARD_RETURN_WEIGHT = 0.8  # 수익률 가중치
+REWARD_SHARPE_WEIGHT = 0.2  # Sharpe ratio 가중치
+REWARD_DRAWDOWN_PENALTY = 0.1  # 드로우다운 페널티 계수
+REWARD_VOL_SCALE_MIN = 0.9  # 변동성 기반 클리핑 최소값
+REWARD_VOL_SCALE_MAX = 1.1  # 변동성 기반 클리핑 최대값
+REWARD_LONG_TERM_BONUS = 0.05  # 장기 보상 보너스 계수
+REWARD_NEGATIVE_WEIGHT = 1.05  # 음수 보상 가중치
 # 새로운 보상 클리핑 범위 추가
-REWARD_CLIP_MIN = -5.0
-REWARD_CLIP_MAX = 5.0
+REWARD_CLIP_MIN = -2.0
+REWARD_CLIP_MAX = 2.0
 # Sharpe ratio 클리핑 값 수정
-SHARPE_RATIO_CLIP = 2.0  # Sharpe ratio 클리핑 (3.0 → 2.0)
+SHARPE_RATIO_CLIP = 3.0
 
 # PPO 하이퍼파라미터 (기본값)
-DEFAULT_HIDDEN_DIM = 256  # 모델 크기 (128 → 256)
-DEFAULT_LR = 1e-5  # 학습률 (3e-5 → 1e-5)
-DEFAULT_GAMMA = 0.995  # 할인율 (0.99 → 0.995)
-DEFAULT_K_EPOCHS = 5  # PPO 에폭 수 (10 → 5)
-DEFAULT_EPS_CLIP = 0.1  # PPO 클리핑 파라미터
-PPO_UPDATE_TIMESTEP = 1000  # PPO 업데이트 주기 (500 → 1000)
-BATCH_SIZE = 128  # 배치 사이즈 명시적 설정
-GRADIENT_CLIP = 0.5  # 그래디언트 클리핑 값
-ENTROPY_COEF = 0.01  # 엔트로피 보너스 계수
-CRITIC_COEF = 0.5  # 크리틱 계수
+DEFAULT_HIDDEN_DIM = 256  # 모델 크기
+DEFAULT_LR = 3e-5  # 학습률
+DEFAULT_GAMMA = 0.99  # 할인율
+DEFAULT_K_EPOCHS = 4  # PPO 에폭 수
+DEFAULT_EPS_CLIP = 0.15  # PPO 클리핑 파라미터
+PPO_UPDATE_TIMESTEP = 500  # PPO 업데이트 주기
+BATCH_SIZE = 64  # 배치 사이즈
+GRADIENT_CLIP = 0.7  # 그래디언트 클리핑 값
+ENTROPY_COEF = 0.02  # 엔트로피 보너스 계수
+CRITIC_COEF = 0.7  # 크리틱 계수
 
 # 환경 설정
 MAX_EPISODE_LENGTH = 504  # 환경의 최대 에피소드 길이
 
 # 상태/보상 정규화 설정
 NORMALIZE_STATES = True
-CLIP_OBS = 10.0
-CLIP_REWARD = 5.0  # 보상 클리핑 범위 축소
-RMS_EPSILON = 1e-8
+CLIP_OBS = 8.0
+CLIP_REWARD = 2.0  # 보상 클리핑 범위
+RMS_EPSILON = 1e-6
 
 # GAE 설정
 LAMBDA_GAE = 0.95

@@ -260,19 +260,31 @@ def train_mode(args, train_data, test_data, train_dates, test_dates, logger):
     # 결과 디렉토리 생성
     if args.results_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.results_dir = os.path.join(RESULTS_BASE_PATH, f"finflow_train_{timestamp}")
+        args.results_dir = os.path.join(RESULTS_BASE_PATH, f"finflow_all_{timestamp}")
         os.makedirs(args.results_dir, exist_ok=True)
-    
-    # 모델 디렉토리 생성
-    model_dir = os.path.join(args.results_dir, "models")
-    os.makedirs(model_dir, exist_ok=True)
-    args.model_path = model_dir
+        
+        # 명시적으로 체크포인트 디렉토리 생성
+        checkpoint_dir = os.path.join(args.results_dir, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # 학습 과정 로깅을 위한 별도 디렉토리
+        logs_dir = os.path.join(args.results_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        # 로깅 파일 핸들러 추가
+        log_file = os.path.join(args.results_dir, "training.log")
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
     
     log_section_header(logger, "단일 모델 학습 시작")
     logger.info(f"학습 결과 저장 디렉토리: {args.results_dir}")
     
     # 에이전트 생성
     agent = create_agent(args, train_data, logger)
+    
+    # 모델 저장 경로 설정
+    agent.model_path = args.results_dir
     
     # 환경 생성
     train_env = StockPortfolioEnv(train_data)

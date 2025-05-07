@@ -16,19 +16,14 @@ import logging
 import pickle
 import gc
 import glob
+import yaml
+import json
+from tqdm import tqdm
 
-from src.models.ppo import PPO
-from src.models.memory import Memory
-from src.environment.portfolio_env import StockPortfolioEnv
-from src.constants import (
-    NUM_EPISODES,
-    ENSEMBLE_SIZE,
-    DEVICE,
-    VALIDATION_INTERVAL,
-    PPO_UPDATE_TIMESTEP,
-    NORMALIZE_STATES,
-    RESULTS_BASE_PATH
-)
+from ..constants import *
+from ..models.memory import Memory
+from ..models.ppo import PPO
+from ..environment.portfolio_env import StockPortfolioEnv
 
 def create_results_dir(mode="train", ensemble_id=None):
     """
@@ -84,6 +79,10 @@ def train_agent(
         run_dir = create_results_dir()
         logger.info(f"결과 디렉토리 생성: {run_dir}")
     
+    # 체크포인트 디렉토리 생성
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     # 학습 메모리 생성
     memory = Memory()
     
@@ -94,21 +93,27 @@ def train_agent(
     validation_reward_history = []
     episode_lengths = []
     best_reward = -float("inf")
+    best_train_reward = -float("inf")
+    no_improvement_count = 0
     
     # 타임스텝 카운터
     time_step = 0
     update_step = 0  # PPO 업데이트 횟수 추적
-    episode_reward_threshold = -10.0  # 조기 종료 임계값
+    episode_reward_threshold = -5.0  # 조기 종료 임계값
     
     # 환경 상태 정규화 관련 변수
     if NORMALIZE_STATES and env.obs_rms is not None:
         ppo_agent.obs_rms = env.obs_rms  # 정규화 상태 공유
     
-    # 탐색(exploration) 매개변수
-    epsilon_start = 0.3  # 초기 탐색 확률
-    epsilon_final = 0.01  # 최종 탐색 확률
-    epsilon_decay = 0.995  # 탐색 확률 감쇠율
+    # 탐색(exploration) 매개변수 수정
+    epsilon_start = 0.4  # 초기 탐색 확률
+    epsilon_final = 0.05  # 최종 탐색 확률
+    epsilon_decay = 0.99  # 탐색 확률 감쇠율
     current_epsilon = epsilon_start  # 현재 탐색 확률
+    
+    # 이동 평균을 위한 변수 추가
+    moving_avg_size = 5  # 이동 평균 윈도우 크기
+    recent_rewards = []  # 최근 보상 저장용
     
     # 학습 시작 로그
     logger.info(f"학습 시작: {num_episodes} 에피소드")
@@ -129,6 +134,7 @@ def train_agent(
         done = False
         truncated = False
         portfolio_values = []
+        raw_rewards = []  # 원시 보상 저장용
         
         # 에피소드 진행
         while not (done or truncated):
@@ -137,15 +143,18 @@ def train_agent(
                 truncated = True
                 break
                 
-            # 액션 선택 (입실론-그리디 탐색 적용)
+            # 액션 선택 (개선된 탐색 전략)
             if np.random.random() < current_epsilon:
-                # 임의 행동 샘플링 (탐색)
-                random_action = np.random.random(env.action_space.shape)
-                random_action /= random_action.sum()  # 합이 1이 되도록 정규화
-                action = random_action
+                # 탐색: 완전 랜덤 액션보다 더 스마트한 전략 사용
+                # 현재 정책의 액션을 기반으로 노이즈 추가
+                action_base, log_prob, value = ppo_agent.policy_old.act(state)
                 
-                # 메모리에 저장하기 위한 log_prob과 value 계산
-                _, log_prob, value = ppo_agent.policy_old.act(state)
+                # 노이즈 추가 (디리클레 분포 활용)
+                # 노이즈 크기는 현재 탐색 확률에 비례
+                noise_scale = current_epsilon * 1.0
+                noise = np.random.dirichlet(np.ones(len(action_base)) * (1.0/noise_scale))
+                action = (1 - current_epsilon) * action_base + current_epsilon * noise
+                action = action / np.sum(action)  # 합이 1이 되도록 정규화
             else:
                 # 정책에 따른 행동 선택 (활용)
                 action, log_prob, value = ppo_agent.policy_old.act(state)
@@ -153,8 +162,13 @@ def train_agent(
             # 환경에서 한 스텝 진행
             next_state, reward, terminated, truncated, info = env.step(action)
             
-            # 메모리에 경험 저장
-            memory.add_experience(state, action, log_prob, reward, terminated, value)
+            # 원시 보상 저장
+            raw_reward = info.get("raw_reward", reward)
+            raw_rewards.append(raw_reward)
+            
+            # 보상 일관성 유지: 원시 보상을 메모리에 저장 (정규화 안된 값)
+            # 이렇게 하면 PPO 업데이트에서 보상을 더 정확하게 반영할 수 있음
+            memory.add_experience(state, action, log_prob, raw_reward, terminated, value)
             
             # 타임스텝 카운터 증가 및 PPO 업데이트 체크
             time_step += 1
@@ -163,8 +177,12 @@ def train_agent(
             if time_step % PPO_UPDATE_TIMESTEP == 0:
                 if len(memory.states) > 100:  # 최소 100개 이상의 샘플이 있을 때만 업데이트
                     logger.debug(f"PPO 업데이트 실행 (타임스텝: {time_step}, 에피소드: {episode})")
+                    
+                    # 메모리 데이터로 한 번의 업데이트 수행
                     loss = ppo_agent.update(memory)
                     loss_history.append(loss)
+                    
+                    # 메모리 클리어 후 두 번째 업데이트 없음 (같은 데이터 재사용하지 않음)
                     memory.clear_memory()
                     update_step += 1
                     
@@ -176,31 +194,62 @@ def train_agent(
             # 내부 상태 업데이트
             state = next_state
             portfolio_values.append(info["portfolio_value"])
-            current_episode_reward += info.get("raw_reward", reward)
+            current_episode_reward += raw_reward  # 원시 보상 누적
             step_count += 1
             
             # 종료 조건 체크
             if terminated:
                 done = True
                 
-            # 너무 낮은 보상값을 보이는 경우 조기 종료 (학습 시간 절약)
-            if current_episode_reward < episode_reward_threshold * (step_count / 10):
-                logger.warning(
-                    f"에피소드 {episode}가 낮은 누적 보상으로 조기 종료됨"
-                )
-                truncated = True
+            # 조기 종료 조건 완화 및 개선 (너무 쉽게 종료되지 않도록)
+            # 처음 20% 스텝은 학습이 안정화되는 시간으로 간주하고 체크 안함
+            initial_warmup = int(env.max_episode_length * 0.2)
+            if step_count > initial_warmup:
+                # 평균 단위 보상이 너무 낮으면 종료
+                avg_step_reward = current_episode_reward / step_count
+                if avg_step_reward < episode_reward_threshold / 10:  # 단위 스텝당 임계값으로 조정
+                    logger.warning(f"에피소드 {episode}가 낮은 평균 보상({avg_step_reward:.4f})으로 조기 종료됨")
+                    truncated = True
         
         # 에피소드 통계 기록
         episode_lengths.append(step_count)
         reward_history.append(current_episode_reward)
         portfolio_value_history.append(portfolio_values)
         
-        # 탐색 확률 감소
-        current_epsilon = max(epsilon_final, current_epsilon * epsilon_decay)
+        # 이동 평균을 위한 최근 보상 업데이트
+        recent_rewards.append(current_episode_reward)
+        if len(recent_rewards) > moving_avg_size:
+            recent_rewards.pop(0)  # 가장 오래된 보상 제거
+        
+        # 현재 이동 평균 계산
+        current_avg_reward = np.mean(recent_rewards)
+        
+        # 탐색 확률 감소 (이동 평균 보상이 증가하면 더 빠르게 감소)
+        if len(recent_rewards) >= 2 and current_avg_reward > np.mean(recent_rewards[:-1]):
+            # 보상이 증가하면 탐색 확률을 더 빠르게 감소
+            current_epsilon = max(epsilon_final, current_epsilon * (epsilon_decay * 0.99))
+        else:
+            # 보상이 증가하지 않으면 기본 감소율 적용
+            current_epsilon = max(epsilon_final, current_epsilon * epsilon_decay)
+        
+        # 학습 정체 상태 확인 및 대응
+        if episode > moving_avg_size:
+            if current_avg_reward > best_train_reward:
+                best_train_reward = current_avg_reward
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+            
+            # 일정 기간 이상 개선이 없으면 탐색 확률 증가 (로컬 최적해 탈출)
+            if no_improvement_count >= 10:
+                logger.info(f"학습 정체 감지: 탐색 확률 증가 ({current_epsilon:.3f} -> {min(0.3, current_epsilon * 1.5):.3f})")
+                current_epsilon = min(0.3, current_epsilon * 1.5)  # 탐색 확률 50% 증가 (최대 0.3)
+                no_improvement_count = 0  # 카운터 리셋
         
         # 에피소드가 끝났지만 메모리에 데이터가 충분하고 일정 주기가 지났으면 추가 업데이트
-        if episode % 5 == 0 and len(memory.states) > 200:
+        if episode % 3 == 0 and len(memory.states) > 200:
             logger.debug(f"에피소드 종료 후 추가 PPO 업데이트 (에피소드: {episode})")
+            # 추가 업데이트도 한 번만 실행 (메모리 재사용 방지)
             loss = ppo_agent.update(memory)
             loss_history.append(loss)
             memory.clear_memory()
@@ -211,6 +260,7 @@ def train_agent(
         logger.info(
             f"=== 에피소드 {episode}/{num_episodes} 완료 "
             f"(보상: {current_episode_reward:.4f}, "
+            f"평균 보상: {current_avg_reward:.4f}, "
             f"포트폴리오: {portfolio_values[-1]:.2f}, "
             f"스텝: {step_count}, "
             f"탐색: {current_epsilon:.3f}, "
@@ -241,6 +291,24 @@ def train_agent(
                     f"Early Stopping 발동: {ppo_agent.early_stopping_patience} 에피소드 동안 성능 향상 없음"
                 )
                 break
+        
+        # 매 20 에피소드마다 체크포인트 저장 (복구용)
+        # 기존 10 에피소드보다 덜 빈번하게 저장하고 체크포인트 디렉토리에 정리해서 저장
+        if episode % 20 == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f"model_ep{episode}.pth")
+            ppo_agent.save_model(episode, current_episode_reward, checkpoint_path)
+            
+            # 오래된 체크포인트는 필요 없으므로 3개만 유지
+            old_checkpoints = sorted(glob.glob(os.path.join(checkpoint_dir, "model_ep*.pth")))
+            if len(old_checkpoints) > 3:
+                for old_checkpoint in old_checkpoints[:-3]:
+                    try:
+                        os.remove(old_checkpoint)
+                        logger.debug(f"오래된 체크포인트 삭제: {old_checkpoint}")
+                    except Exception as e:
+                        logger.warning(f"체크포인트 삭제 실패: {e}")
+            
+            logger.debug(f"체크포인트 저장: {checkpoint_path}")
                 
     # 총 학습 시간 출력
     total_training_time = time.time() - training_start_time
