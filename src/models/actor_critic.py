@@ -90,7 +90,7 @@ class ActorCritic(nn.Module):
         # 자산별 특징 압축 레이어
         self.asset_compression = nn.Sequential(
             nn.Linear(self.lstm_output_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.BatchNorm1d(hidden_dim),  # 배치 정규화 추가
             nn.ReLU(),
             nn.Dropout(0.1)
         ).to(DEVICE)
@@ -98,21 +98,22 @@ class ActorCritic(nn.Module):
         # 공통 특징 추출 레이어 (더 깊고 넓게)
         self.actor_critic_base = nn.Sequential(
             nn.Linear(hidden_dim * n_assets, hidden_dim * 2),  # 더 넓은 레이어
-            nn.LayerNorm(hidden_dim * 2),
+            nn.BatchNorm1d(hidden_dim * 2),  # 배치 정규화로 변경
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.BatchNorm1d(hidden_dim),  # 배치 정규화로 변경
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),  # 배치 정규화로 변경
             nn.ReLU(),
         ).to(DEVICE)
 
         # 액터 헤드 (로짓 출력)
         self.actor_head = nn.Sequential(
             nn.Linear(hidden_dim // 2, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),  # 배치 정규화 추가
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, self.n_assets)
         ).to(DEVICE)
@@ -120,6 +121,7 @@ class ActorCritic(nn.Module):
         # 크리틱 헤드 (상태 가치)
         self.critic_head = nn.Sequential(
             nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.BatchNorm1d(hidden_dim // 4),  # 배치 정규화 추가
             nn.ReLU(),
             nn.Linear(hidden_dim // 4, 1)
         ).to(DEVICE)
@@ -143,6 +145,10 @@ class ActorCritic(nn.Module):
                     nn.init.orthogonal_(param, 1.0)
                 elif "bias" in name:
                     nn.init.constant_(param, 0.0)
+        elif isinstance(module, nn.BatchNorm1d):
+            # 배치 정규화 초기화
+            nn.init.constant_(module.weight, 1.0)  # 가중치를 1로 초기화
+            nn.init.constant_(module.bias, 0.0)  # 편향을 0으로 초기화
 
     def update_temperature(self):
         """학습 과정에서 온도 값을 점진적으로 감소시킵니다."""
@@ -193,8 +199,9 @@ class ActorCritic(nn.Module):
             # 마지막 시퀀스 출력 추출 (batch, lstm_output_dim)
             asset_out = context[:, -1, :]
             
-            # 자산별 특징 압축
-            compressed = self.asset_compression(asset_out)
+            # 자산별 특징 압축 (배치 정규화를 위해 차원 변경)
+            asset_out_flattened = asset_out.reshape(batch_size, -1)
+            compressed = self.asset_compression(asset_out_flattened)
             
             lstm_outputs.append(compressed)
 
@@ -248,66 +255,68 @@ class ActorCritic(nn.Module):
             elif state.ndim == 1:  # 이미 평탄화된 경우? (호환성 위해)
                 state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(DEVICE)
             else:
-                raise ValueError(
-                    f"act 메서드: 예상치 못한 NumPy 상태 차원: {state.shape}"
-                )
-        elif torch.is_tensor(state):
-            if state.dim() == 2:
-                state_tensor = state.float().unsqueeze(0).to(DEVICE)
-            elif state.dim() == 1:
-                state_tensor = state.float().unsqueeze(0).to(DEVICE)
-            else:
-                raise ValueError(
-                    f"act 메서드: 예상치 못한 Tensor 상태 차원: {state.shape}"
-                )
+                raise ValueError(f"Unsupported state shape: {state.shape}")
         else:
-            raise TypeError(f"act 메서드: 지원하지 않는 상태 타입: {type(state)}")
+            state_tensor = state.unsqueeze(0) if state.dim() == 2 else state
 
-        # 그래디언트 계산 비활성화 (추론 모드)
+        # 평가 모드에서 실행 (배치 정규화 등을 위해)
+        self.eval()
+        
         with torch.no_grad():
-            action_probs, value = self.forward(state_tensor)
+            # 네트워크로 액션 확률과 가치 계산
+            action_probs, state_value = self.forward(state_tensor)
 
-            # 확률 분포에서 행동 샘플링
+            # 액션 확률 분포 생성
             dist = torch.distributions.Categorical(action_probs)
+            
+            # 액션 샘플링
             action_idx = dist.sample()
-            log_prob = dist.log_prob(action_idx)
-
-            # 인덱스에서 원-핫 인코딩으로 변환 (자산 비중 표현)
+            
+            # 원-핫 인코딩으로 변환
             action = torch.zeros_like(action_probs)
             action.scatter_(1, action_idx.unsqueeze(-1), 1.0)
-
-        # 결과를 CPU NumPy 배열 및 스칼라 값으로 변환하여 반환
-        return action.squeeze(0).cpu().numpy(), log_prob.item(), value.item()
+            
+            # 로그 확률 계산
+            log_prob = dist.log_prob(action_idx)
+            
+            # 학습 모드로 복원
+            self.train()
+            
+            # NumPy로 변환하여 반환
+            return (
+                action.squeeze(0).cpu().numpy(),
+                log_prob.item(),
+                state_value.squeeze().item()
+            )
 
     def evaluate(self, states, actions):
         """
-        주어진 상태(states)와 행동(actions)에 대한 로그 확률(log_prob),
-        분포 엔트로피(entropy), 상태 가치(value)를 계산합니다.
+        주어진 상태와 액션에 대한 로그 확률, 엔트로피, 상태 가치를 계산합니다.
         PPO 업데이트 시 사용됩니다.
 
         Args:
-            states (torch.Tensor): 상태 배치.
-            actions (torch.Tensor): 행동 배치 (원-핫 인코딩 형태).
+            states (torch.Tensor): 상태 배치 텐서.
+            actions (torch.Tensor): 액션 배치 텐서.
 
         Returns:
-            tuple: (log_prob, entropy, value)
-                   - log_prob (torch.Tensor): 각 행동의 로그 확률.
-                   - entropy (torch.Tensor): 분포의 엔트로피.
-                   - value (torch.Tensor): 각 상태의 예측된 가치 (1D Tensor).
+            tuple: (log_probs, entropy, state_values)
+                   - log_probs (torch.Tensor): 액션의 로그 확률.
+                   - entropy (torch.Tensor): 정책의 엔트로피.
+                   - state_values (torch.Tensor): 상태 가치.
         """
-        action_probs, value = self.forward(states)
-
-        # 행동이 원-핫 인코딩된 경우, 인덱스로 변환
-        if actions.size(-1) == action_probs.size(-1):
-            actions_idx = torch.argmax(actions, dim=-1)
-        else:
-            actions_idx = actions
-
-        # Categorical 분포 생성
+        # 정책과 가치 함수 출력
+        action_probs, state_values = self.forward(states)
+        
+        # 디스트리뷰션 생성
         dist = torch.distributions.Categorical(action_probs)
-
-        log_prob = dist.log_prob(actions_idx)
+        
+        # 액션 인덱스 추출 (원-핫 인코딩된 액션에서)
+        action_indices = torch.argmax(actions, dim=1)
+        
+        # 로그 확률 계산
+        log_probs = dist.log_prob(action_indices)
+        
+        # 엔트로피 계산
         entropy = dist.entropy()
-
-        # value 텐서의 형태를 (batch_size,)로 일관성 있게 조정
-        return log_prob, entropy, value.view(-1) 
+        
+        return log_probs, entropy, state_values 

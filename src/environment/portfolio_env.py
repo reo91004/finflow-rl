@@ -24,6 +24,11 @@ from src.constants import (
     REWARD_VOL_SCALE_MIN,
     REWARD_VOL_SCALE_MAX,
     REWARD_ACCUMULATION_DAYS,
+    REWARD_LONG_TERM_BONUS,
+    REWARD_NEGATIVE_WEIGHT,
+    REWARD_CLIP_MIN,
+    REWARD_CLIP_MAX,
+    SHARPE_RATIO_CLIP,
     RMS_EPSILON,
     CLIP_OBS,
     CLIP_REWARD
@@ -143,7 +148,7 @@ class StockPortfolioEnv(gym.Env):
             window_size (int): Sharpe ratio 계산에 사용할 기간 길이.
 
         Returns:
-            float: 계산된 Sharpe ratio 값.
+            float: 계산된 Sharpe ratio 값 (클리핑 적용).
         """
         if len(self.returns_history) < 2:  # 최소 2개의 수익률이 필요
             return 0.0
@@ -161,15 +166,18 @@ class StockPortfolioEnv(gym.Env):
 
         # 표준편차가 0에 가까우면 Sharpe ratio는 정의되지 않음
         if std_return < 1e-8:
-            return 0.0 if mean_return < 0 else 10.0  # 양수 수익률이면 높은 값, 음수면 0
+            return 0.0 if mean_return < 0 else SHARPE_RATIO_CLIP  # 양수 수익률이면 최대 클리핑 값
 
         # 일별 Sharpe ratio 계산 (무위험 수익률 0 가정)
         daily_sharpe = mean_return / std_return
 
         # 연율화 (252 거래일 기준)
         annualized_sharpe = daily_sharpe * np.sqrt(252)
+        
+        # Sharpe ratio 클리핑 (3.0 → 2.0으로 감소)
+        clipped_sharpe = np.clip(annualized_sharpe, -SHARPE_RATIO_CLIP, SHARPE_RATIO_CLIP)
 
-        return annualized_sharpe
+        return clipped_sharpe
 
     def _calculate_drawdown(self):
         """
@@ -370,8 +378,8 @@ class StockPortfolioEnv(gym.Env):
         threshold = 0.02  # 2% 이하의 변화는 무시
         significant_changes = np.where(weight_changes > threshold, weight_changes, 0.0)
         
-        # 페널티 계수 증가 (0.001 → 0.002)
-        action_change_penalty = 0.002 * np.sum(significant_changes)
+        # 페널티 계수 적용
+        action_change_penalty = self.action_penalty_coef * np.sum(significant_changes)
 
         # 목표 자산 가치 계산 (현금 제외한 주식 부분만)
         stock_weights = action_with_cash[:-1]
@@ -436,7 +444,7 @@ class StockPortfolioEnv(gym.Env):
 
         # --- 개선된 보상 계산 방식 ---
 
-        # 1. K-일 누적 수익률 계산
+        # 1. K-일 누적 수익률 계산 (장기적 성과 고려)
         if len(self.portfolio_value_history) > REWARD_ACCUMULATION_DAYS:
             k_day_ago_value = self.portfolio_value_history[-REWARD_ACCUMULATION_DAYS-1]
             if k_day_ago_value > 1e-8:
@@ -445,30 +453,36 @@ class StockPortfolioEnv(gym.Env):
                 k_day_return = -1.0
         else:
             k_day_return = daily_return
+        
+        # 장기 보상 보너스 적용 (0.3 → 0.1로 감소)
+        long_term_bonus = REWARD_LONG_TERM_BONUS * k_day_return if k_day_return > 0 else 0
 
-        # 2. Sharpe ratio 계산 (단순화)
+        # 2. Sharpe ratio 계산 (개선됨)
         sharpe_ratio = self._calculate_sharpe_ratio()
-        sharpe_component = np.clip(sharpe_ratio / 2.0, -1, 1) * 0.3  # Sharpe ratio 가중치 감소
+        # Sharpe ratio 가중치 조정
+        sharpe_component = sharpe_ratio * REWARD_SHARPE_WEIGHT
 
-        # 3. 드로우다운 페널티 (단순화)
+        # 3. 드로우다운 페널티
         drawdown = self._calculate_drawdown()
-        drawdown_penalty = 0.2 * drawdown  # 페널티 가중치 감소
+        drawdown_penalty = REWARD_DRAWDOWN_PENALTY * drawdown
 
-        # 4. 최종 보상 계산 (단순화)
-        # - 수익률: 0.7 가중치
-        # - Sharpe ratio: 0.3 가중치
-        # - 드로우다운 페널티: 0.2 가중치
-        # - 행동 변화 페널티: 기존과 동일
+        # 4. 최종 보상 계산 (개선된 가중치 및 구성 요소)
+        # 일일 수익률 (주요 보상 구성 요소)
+        return_component = np.tanh(daily_return) * REWARD_RETURN_WEIGHT
+        
+        # 음수 보상에 더 높은 가중치 적용 (1.2 → 1.1로 감소)
+        if return_component < 0:
+            return_component *= REWARD_NEGATIVE_WEIGHT
 
-        # 수익률 기여도 (tanh로 비선형 클리핑)
-        return_component = np.tanh(k_day_return) * 0.7
-
-        # 최종 보상 계산
-        raw_reward = return_component + sharpe_component - drawdown_penalty - action_change_penalty
+        # 최종 보상 계산 (모든 구성 요소 합산)
+        raw_reward = return_component + sharpe_component + long_term_bonus - drawdown_penalty - action_change_penalty
 
         # NaN/Inf 처리
         if np.isnan(raw_reward) or np.isinf(raw_reward):
             raw_reward = -1.0
+            
+        # 보상 클리핑 적용 (-5.0 ~ 5.0)
+        raw_reward = np.clip(raw_reward, REWARD_CLIP_MIN, REWARD_CLIP_MAX)
 
         # 다음 상태 및 보상 정규화
         next_obs_norm = self._normalize_obs(next_obs_raw)
@@ -484,6 +498,7 @@ class StockPortfolioEnv(gym.Env):
             "raw_reward": raw_reward,
             "action_penalty": action_change_penalty,
             "k_day_return": k_day_return if "k_day_return" in locals() else 0.0,
+            "long_term_bonus": long_term_bonus if "long_term_bonus" in locals() else 0.0,
             "sharpe_ratio": sharpe_ratio,
             "drawdown": drawdown,
             "volatility_scaling": self.volatility_scaling,
