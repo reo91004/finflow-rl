@@ -70,7 +70,7 @@ SOFTMAX_TEMPERATURE_DECAY = 0.999
 REWARD_ACCUMULATION_DAYS = 5
 
 # 보상 함수 관련 설정
-REWARD_SHARPE_WINDOW = 10  # Sharpe ratio 계산 윈도우 (15→10)
+REWARD_SHARPE_WINDOW = 20  # Sharpe ratio 계산 윈도우 (15→10 에서 past.py 기본값 20으로 변경)
 REWARD_RETURN_WEIGHT = 0.75  # 수익률 가중치 (0.8→0.75)
 REWARD_SHARPE_WEIGHT = 0.25  # Sharpe ratio 가중치 (0.2→0.25)
 REWARD_DRAWDOWN_PENALTY = 0.15  # 드로우다운 페널티 계수 (0.1→0.15)
