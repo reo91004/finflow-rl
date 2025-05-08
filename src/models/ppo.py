@@ -187,12 +187,24 @@ class PPO:
                         dist = torch.distributions.Categorical(action_probs)
                         action_idx = dist.sample()
 
-                        # 원-핫 인코딩으로 변환
+                        # 안전하게 처리: 텐서 형태 확인 후 변환
                         action = torch.zeros_like(action_probs)
                         action.scatter_(1, action_idx.unsqueeze(-1), 1.0)
-                        action = action.squeeze(0).cpu().numpy()
+                        
+                        # 예외 처리 추가
+                        try:
+                            if action.shape[0] == 1:  # 배치 차원이 존재하는 경우
+                                action = action.squeeze(0).cpu().numpy()
+                            else:
+                                action = action.cpu().numpy()  # 배치 차원이 없는 경우
+                        except Exception as e:
+                            # 오류 발생 시 원본 텐서 확인 후 안전하게 변환
+                            self.logger.warning(f"validate 액션 변환 중 오류: {e}, 형태: {action.shape}")
+                            action = action.detach().cpu().numpy()
+                            if len(action.shape) > 1 and action.shape[0] == 1:
+                                action = action[0]  # 첫 번째 배치 항목만 사용
                 else:
-                    action, _, _ = self.policy_old.act(state)
+                    action = self.select_action(state, use_ema=False)
 
                 next_state, reward, terminated, truncated, info = env.step(action)
                 episode_reward += reward
@@ -238,7 +250,7 @@ class PPO:
 
             # 로깅
             self.logger.info(
-                f"최고 검증 보상 {self.best_validation_reward:.4f} 대비 향상 없음. "
+                f"최고 검증 보상 {float(self.best_validation_reward):.4f} 대비 향상 없음. "
                 f"인내심 카운터: {self.no_improvement_episodes}/{self.early_stopping_patience}"
             )
 
@@ -246,7 +258,7 @@ class PPO:
             if self.no_improvement_episodes >= self.early_stopping_patience:
                 self.logger.warning(
                     f"Early Stopping 조건 충족! {self.early_stopping_patience} 에피소드 동안 "
-                    f"성능 향상 없음. 최고 검증 보상: {self.best_validation_reward:.4f}"
+                    f"성능 향상 없음. 최고 검증 보상: {float(self.best_validation_reward):.4f}"
                 )
                 self.should_stop_early = True
                 return True
@@ -284,7 +296,7 @@ class PPO:
                 # 최고 성능 모델 저장
                 save_file = os.path.join(self.model_path, "best_model.pth")
                 self.best_reward = reward
-                self.logger.info(f"새로운 최고 성능! 보상: {reward:.4f} -> {save_file}")
+                self.logger.info(f"새로운 최고 성능! 보상: {float(reward):.4f} -> {save_file}")
             else:
                 # 체크포인트 저장
                 checkpoint_dir = os.path.join(self.model_path, "checkpoints")
@@ -314,7 +326,7 @@ class PPO:
         try:
             # 모델 저장
             torch.save(save_dict, save_file)
-            self.logger.info(f"모델 저장 완료: {save_file} (보상: {reward:.4f})")
+            self.logger.info(f"모델 저장 완료: {save_file} (보상: {float(reward):.4f})")
             return True
         except Exception as e:
             self.logger.error(f"모델 저장 중 오류 발생: {e}")
@@ -481,8 +493,8 @@ class PPO:
             returns.insert(0, gae + values[step])
         
         # 계산된 returns과 advantages를 텐서로 변환
-        returns = torch.tensor(returns, dtype=torch.float32).to(DEVICE)
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(DEVICE)
+        returns = torch.tensor(np.array(returns), dtype=torch.float32).to(DEVICE)
+        advantages = torch.tensor(np.array(advantages), dtype=torch.float32).to(DEVICE)
         
         # Advantages 정규화 (학습 안정성 향상)
         if len(advantages) > 1:
@@ -500,10 +512,16 @@ class PPO:
         Returns:
             float: 평균 손실값
         """
-        # 경험 부족 시 건너뛰기
-        if len(memory.states) < self.batch_size:
+        # 경험 부족 시 더 작은 배치 크기 사용
+        actual_batch_size = min(self.batch_size, len(memory.states))
+        if len(memory.states) < self.batch_size * 0.5:  # 최소한 배치 크기의 절반은 있어야 함
             self.logger.warning(f"경험 부족으로 업데이트 건너뜀 (필요: {self.batch_size}, 현재: {len(memory.states)})")
             return 0.0
+        elif len(memory.states) < self.batch_size:
+            # 배치 크기 조정하여 경고 대신 학습 진행
+            self.logger.info(f"배치 크기 조정: {self.batch_size} → {actual_batch_size} (가용 경험: {len(memory.states)})")
+        else:
+            actual_batch_size = self.batch_size
 
         # GAE를 사용하여 returns와 advantages 계산
         returns, advantages = self.compute_returns_and_advantages(memory)
@@ -514,7 +532,6 @@ class PPO:
         old_logprobs = torch.FloatTensor(np.array(memory.logprobs)).to(DEVICE)
         
         # 배치 인덱스 생성
-        batch_size = self.batch_size
         indices = np.arange(len(old_states))
         
         # 여러 에포크 동안 미니배치로 학습
@@ -537,9 +554,9 @@ class PPO:
             np.random.shuffle(indices)
             
             # 미니배치 반복
-            for start_idx in range(0, len(indices), batch_size):
+            for start_idx in range(0, len(indices), actual_batch_size):
                 # 배치 인덱스 선택
-                idx = indices[start_idx:start_idx + batch_size]
+                idx = indices[start_idx:min(start_idx + actual_batch_size, len(indices))]
                 
                 # 배치 데이터 추출
                 batch_states = old_states[idx]
@@ -560,7 +577,7 @@ class PPO:
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
                 # 가치 함수 손실 계산
-                value_loss = self.critic_coef * self.MseLoss(state_values, batch_returns)
+                value_loss = self.critic_coef * self.MseLoss(state_values, batch_returns.squeeze(-1))
                 
                 # 엔트로피 보너스 (탐색 촉진)
                 entropy_loss = -self.entropy_coef * dist_entropy.mean()
@@ -591,6 +608,12 @@ class PPO:
         # EMA 모델 업데이트
         if self.use_ema:
             self.update_ema_model()
+            
+        # 학습률 스케줄러 업데이트 - optimizer.step() 다음에 호출해야 함
+        if self.use_lr_scheduler and self.scheduler:
+            self.scheduler.step()
+            current_lr = self.scheduler.get_last_lr()[0]
+            self.logger.debug(f"학습률 업데이트: {current_lr:.7f}")
         
         # 평균 손실 계산
         avg_loss = total_loss / max(1, n_updates)

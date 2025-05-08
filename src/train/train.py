@@ -173,11 +173,6 @@ def train_agent(
                     # 메모리 클리어 후 두 번째 업데이트 없음 (같은 데이터 재사용하지 않음)
                     memory.clear_memory()
                     update_step += 1
-                    
-                    # PPO 업데이트 후에 학습률 스케줄러 업데이트
-                    current_lr = ppo_agent.update_lr_scheduler()
-                    if current_lr is not None:
-                        logger.debug(f"학습률 업데이트: {current_lr:.7f}")
             
             # 내부 상태 업데이트
             state = next_state
@@ -252,7 +247,7 @@ def train_agent(
             validation_reward_history.append((episode, validation_reward))
             
             logger.info(
-                f"검증 결과 (에피소드 {episode}): 평균 보상 {validation_reward:.4f}"
+                f"검증 결과 (에피소드 {episode}): 평균 보상 {float(validation_reward):.4f}"
             )
             
             # 가장 좋은 모델 저장
@@ -261,7 +256,7 @@ def train_agent(
                 model_file = os.path.join(run_dir, "best_model.pth")
                 ppo_agent.save_model(episode, validation_reward)
                 logger.info(
-                    f"새로운 최고 성능! 보상: {validation_reward:.4f} -> {model_file}"
+                    f"새로운 최고 성능! 보상: {float(validation_reward):.4f} -> {model_file}"
                 )
                 
             # Early Stopping 체크

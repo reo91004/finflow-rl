@@ -91,6 +91,7 @@ class StockPortfolioEnv(gym.Env):
 
         # 내부 상태 변수 초기화 (reset에서 수행)
         self.current_step = 0
+        self.start_index = 0  # 에피소드 시작 인덱스 저장
         self.cash = 0.0
         self.holdings = np.zeros(self.n_assets, dtype=np.float32)  # 보유 주식 수
         self.portfolio_value = 0.0  # 현재 포트폴리오 가치
@@ -157,17 +158,21 @@ class StockPortfolioEnv(gym.Env):
         if reward < 0:
             reward = reward * REWARD_NEGATIVE_WEIGHT
         
+        # 이상치 제거 (너무 큰 값이나 너무 작은 값)
+        if np.abs(reward) > 2.0:  # 절댓값이 2.0 이상인 보상 조정
+            reward = np.sign(reward) * (np.log(1 + np.abs(reward)) + 1.0)
+        
         # 누적 할인 보상 업데이트
         self.returns_norm = self.gamma * self.returns_norm + reward
         
-        # 보상 정규화 통계 업데이트 (5스텝마다)
-        if self.current_step % 5 == 0:
+        # 보상 정규화 통계 업데이트 (매 스텝마다)
+        if self.current_step % 1 == 0:
             self.ret_rms.update(np.array([self.returns_norm]))
         
         # 보상 정규화 및 클리핑
         std = np.sqrt(self.ret_rms.var + RMS_EPSILON)
         normalized_reward = np.clip(
-            reward / std, 
+            reward / (std + 1e-8), 
             REWARD_CLIP_MIN, 
             REWARD_CLIP_MAX
         )
@@ -286,16 +291,18 @@ class StockPortfolioEnv(gym.Env):
         if start_index is None:
             max_start_index = max(0, self.n_steps - self.max_episode_length)
             if max_start_index == 0:
-                start_index = 0
+                self.start_index = 0
             else:
-                start_index = np.random.randint(
+                self.start_index = np.random.randint(
                     0, max_start_index + 1
                 )  # 0부터 시작 가능하도록 +1
         elif start_index >= self.n_steps:
-            start_index = max(0, self.n_steps - 1)
-            logger.warning(f"시작 인덱스가 데이터 길이를 초과하여 {start_index}로 조정됨")
+            self.start_index = max(0, self.n_steps - 1)
+            logger.warning(f"시작 인덱스가 데이터 길이를 초과하여 {self.start_index}로 조정됨")
+        else:
+            self.start_index = start_index
 
-        self.current_step = start_index
+        self.current_step = self.start_index # 현재 스텝을 시작 인덱스로 설정
         self.cash = self.initial_cash
         self.holdings = np.zeros(self.n_assets, dtype=np.float32)
         self.portfolio_value = self.initial_cash
@@ -380,8 +387,13 @@ class StockPortfolioEnv(gym.Env):
         # 다음 스텝으로 이동
         self.current_step += 1
 
-        # 포트폴리오 수익률 계산
+        # 포트폴리오 수익률 계산 및 이상치 처리
         raw_return = (self.portfolio_value / prev_portfolio_value) - 1.0
+        
+        # 이상치 관리: 너무 큰 변동성은 로그 스케일로 변환하여 완화
+        if np.abs(raw_return) > 0.1:  # 10% 이상 변동은 로그 스케일로 변환
+            raw_return = np.sign(raw_return) * np.log(1 + np.abs(raw_return))
+            
         self.returns_history.append(raw_return)
 
         # 최대 포트폴리오 가치 업데이트
@@ -389,23 +401,38 @@ class StockPortfolioEnv(gym.Env):
             self.max_portfolio_value = self.portfolio_value
             
         # 가격 변동성 추적 (현재 데이터의 일일 변동성)
-        if self.current_step > 0:
-            yesterday_close = self.data[self.current_step - 1, :, 3]  # 전일 종가
-            today_close = self.data[self.current_step, :, 3]  # 당일 종가
-            returns = (today_close / yesterday_close) - 1.0  # 수익률
-            volatility = np.std(returns)  # 변동성 (전체 자산의 표준편차)
-            self.market_volatility_window.append(volatility)
-            
-            # 변동성에 따른 보상 스케일링 값 업데이트
-            self.volatility_scaling = self._calculate_volatility_scaling()
+        if self.current_step > 0 and self.current_step < len(self.data):
+            try:
+                yesterday_close = self.data[self.current_step - 1, :, 3]  # 전일 종가
+                today_close = self.data[self.current_step, :, 3]  # 당일 종가
+                
+                # NaN 및 무한값 처리
+                valid_mask = np.isfinite(yesterday_close) & np.isfinite(today_close) & (yesterday_close > 0)
+                if np.any(valid_mask):
+                    returns = (today_close[valid_mask] / yesterday_close[valid_mask]) - 1.0  # 수익률
+                    volatility = np.std(returns)  # 변동성 (전체 자산의 표준편차)
+                    
+                    # 이상치 처리 - 너무 높은 변동성은 제한
+                    volatility = min(volatility, 0.05)  # 5% 이상 변동성은 제한
+                    
+                    self.market_volatility_window.append(volatility)
+                    
+                    # 변동성에 따른 보상 스케일링 값 업데이트
+                    self.volatility_scaling = self._calculate_volatility_scaling()
+            except Exception as e:
+                # 변동성 계산 중 오류 발생시 기본값 사용
+                self.volatility_scaling = 1.0
         
-        # 행동 변화 페널티 계산
+        # 행동 변화 페널티 계산 - 지나치게 잦은 포트폴리오 변화 방지
         action_change_penalty = 0.0
         if self.action_penalty_coef > 0:
             action_diff = np.abs(action - self.prev_weights).mean()
-            action_change_penalty = self.action_penalty_coef * action_diff
+            
+            # 작은 변화는 무시, 큰 변화에만 페널티 부여
+            if action_diff > 0.1:  # 10% 이상 변화에만 페널티
+                action_change_penalty = self.action_penalty_coef * action_diff
 
-        # 기본 보상 계산 (K-일 수익률)
+        # 기본 보상 계산 (K-일 수익률) - 단기/중기 수익성 평가
         if REWARD_ACCUMULATION_DAYS <= 1:
             # 단일 스텝 보상
             reward_return = raw_return
@@ -415,24 +442,41 @@ class StockPortfolioEnv(gym.Env):
                 k_day_return = (
                     self.portfolio_value_history[-1] / self.portfolio_value_history[-REWARD_ACCUMULATION_DAYS]
                 ) - 1.0
-                reward_return = k_day_return
+                
+                # 중간 수익률도 고려 (지속적 수익성 확인)
+                mid_point = max(1, REWARD_ACCUMULATION_DAYS // 2)
+                mid_return = (
+                    self.portfolio_value_history[-1] / self.portfolio_value_history[-mid_point]
+                ) - 1.0
+                
+                # 단기 및 중기 수익률 모두 고려
+                reward_return = 0.7 * k_day_return + 0.3 * mid_return
             else:
                 reward_return = raw_return
 
         # Sharpe ratio 계산 (안정적인 투자를 위한 변동성 고려)
         sharpe = self._calculate_sharpe_ratio()
         
-        # 드로우다운 페널티 계산
+        # 드로우다운 페널티 계산 - 손실 위험 제한
         drawdown = self._calculate_drawdown()
-        drawdown_penalty = REWARD_DRAWDOWN_PENALTY * drawdown if drawdown > 0 else 0.0
+        # 드로우다운에 대한 비선형 페널티 적용 (손실이 커질수록 페널티 가중)
+        if drawdown > 0:
+            drawdown_penalty = REWARD_DRAWDOWN_PENALTY * (drawdown + 0.5 * drawdown**2)
+        else:
+            drawdown_penalty = 0.0
         
         # 장기 보상 보너스 (지속적인 개선을 위한 누적 수익률)
         long_term_bonus = 0.0
         if len(self.returns_history) > 20:  # 최소 20일 이상 데이터가 있을 때
-            # 과거 20일 수익률의 누적 곱
-            cumulative_return = np.prod(1 + np.array(self.returns_history[-20:])) - 1
+            # 과거 20일 수익률의 누적 곱 (기하 평균 수익률)
+            returns_array = np.array(self.returns_history[-20:])
+            # 이상치 제거: -50% ~ +50% 범위로 제한
+            returns_array = np.clip(returns_array, -0.5, 0.5)
+            cumulative_return = np.prod(1 + returns_array) - 1
+            
             if cumulative_return > 0:
-                long_term_bonus = REWARD_LONG_TERM_BONUS * cumulative_return
+                # 수익률이 높을수록 보너스 증가 (비선형)
+                long_term_bonus = REWARD_LONG_TERM_BONUS * (cumulative_return + 0.2 * cumulative_return**2)
 
         # 보상 합산
         reward = (
@@ -446,13 +490,13 @@ class StockPortfolioEnv(gym.Env):
         # 보상 정규화
         normalized_reward = self._normalize_reward(reward)
         
-        # 변동성에 따른 보상 스케일링 적용
+        # 변동성에 따른 보상 스케일링 적용 - 변동성 높을 때 보상 민감도 조정
         scaled_reward = normalized_reward * self.volatility_scaling
         
         # 관측값, 정보, 종료 여부 등 획득
         observation = self._get_observation()
-        terminated = (self.portfolio_value <= self.initial_cash * 0.1)  # 자산 90% 이상 손실 시 종료
-        truncated = (self.current_step >= min(self.n_steps - 1, start_index + self.max_episode_length))
+        terminated = (self.portfolio_value <= self.initial_cash * 0.2)  # 자산 80% 이상 손실 시 종료 (기존 90%보다 완화)
+        truncated = (self.current_step >= min(self.n_steps - 1, self.start_index + self.max_episode_length))
         info = self._get_info()
         
         # 원시 보상값 정보에 추가
