@@ -72,6 +72,14 @@ class PPO:
         self.n_assets = n_assets
         self.n_features = n_features  # 추가
         self.entropy_coef = DEFAULT_ENTROPY_COEF  # 엔트로피 계수 추가
+        self.gradient_clip = GRADIENT_CLIP
+        self.critic_coef = CRITIC_COEF
+        self.batch_size = BATCH_SIZE
+        self.lr = lr
+        
+        # 학습 안정화를 위한 설정
+        self.gae_lambda = LAMBDA_GAE
+        self.clip_grad_norm = True
 
         # EMA 가중치 옵션
         self.use_ema = use_ema
@@ -101,7 +109,7 @@ class PPO:
                 param.requires_grad = False
 
         # 옵티마이저 및 손실 함수
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+        self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=lr, weight_decay=1e-5)
         self.MseLoss = nn.MSELoss()  # 크리틱 손실용
 
         # 학습률 스케줄러 (Cosine Annealing)
@@ -119,11 +127,21 @@ class PPO:
         # GPU 설정 (성능 향상 최적화 옵션)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            # 행렬 곱셈 연산 정밀도 설정 (A100/H100 등 TensorFloat32 지원 시 유리)
-            # torch.set_float32_matmul_precision('high') # 또는 'medium'
-            
-        # 배치 정규화 변수 추가
-        self.use_batch_norm = True
+        
+        # 모델 가중치 초기화
+        self._init_weights()
+
+    def _init_weights(self):
+        """모델 가중치를 적절하게 초기화합니다."""
+        for module in self.policy.modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                # He 초기화 (ReLU 활성화 함수에 적합)
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def update_lr_scheduler(self):
         """학습률 스케줄러를 업데이트합니다."""
@@ -150,10 +168,12 @@ class PPO:
             self.policy_ema.eval()
 
         total_reward = 0
+        raw_rewards = []
 
         for _ in range(n_episodes):
             state, _ = env.reset()
             episode_reward = 0
+            episode_raw_reward = 0
             done = False
 
             while not done:
@@ -175,7 +195,8 @@ class PPO:
                     action, _, _ = self.policy_old.act(state)
 
                 next_state, reward, terminated, truncated, info = env.step(action)
-                episode_reward += info.get("raw_reward", reward)
+                episode_reward += reward
+                episode_raw_reward += info.get("raw_reward", reward)
 
                 if terminated or truncated:
                     done = True
@@ -183,6 +204,7 @@ class PPO:
                     state = next_state
 
             total_reward += episode_reward
+            raw_rewards.append(episode_raw_reward)
 
         # 학습 모드로 복원
         self.policy_old.train()
@@ -249,288 +271,337 @@ class PPO:
 
     def save_model(self, episode, reward, save_file=None):
         """
-        모델의 가중치와 옵티마이저 상태, obs_rms 통계를 저장합니다.
-        
+        학습된 모델을 저장합니다.
+
         Args:
-            episode (int): 현재 에피소드 번호
-            reward (float): 현재 보상 
-            save_file (str, optional): 저장할 파일 경로. None이면 best_model.pth 또는 final_model.pth로 저장
-        
-        Returns:
-            bool: 저장 성공 여부
+            episode: 현재 에피소드 번호
+            reward: 검증 보상 값
+            save_file: 저장할 파일 경로 (None이면 자동 생성)
         """
-        # 저장 경로 설정
         if save_file is None:
+            # 파일명 자동 생성
             if reward > self.best_reward:
-                self.best_reward = reward
+                # 최고 성능 모델 저장
                 save_file = os.path.join(self.model_path, "best_model.pth")
-            else:
-                save_file = os.path.join(self.model_path, "final_model.pth")
-        else:
-            # 외부에서 경로 지정하는 경우 (체크포인트)
-            if reward > self.best_reward:
                 self.best_reward = reward
-            
+                self.logger.info(f"새로운 최고 성능! 보상: {reward:.4f} -> {save_file}")
+            else:
+                # 체크포인트 저장
+                checkpoint_dir = os.path.join(self.model_path, "checkpoints")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                save_file = os.path.join(checkpoint_dir, f"model_ep{episode}.pth")
+
+        # 저장할 모델과 데이터 준비
+        if self.use_ema:
+            # EMA 모델이 있으면 EMA 모델 저장
+            model_state_dict = self.policy_ema.state_dict()
+        else:
+            # 없으면 현재 모델 저장
+            model_state_dict = self.policy.state_dict()
+
+        # 추가 정보와 함께 저장
+        save_dict = {
+            "model_state_dict": model_state_dict,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "reward": reward,
+            "episode": episode,
+            "obs_rms": self.obs_rms if self.obs_rms is not None else None,
+            "n_assets": self.n_assets,
+            "n_features": self.n_features,
+            "hidden_dim": self.policy.hidden_dim if hasattr(self.policy, "hidden_dim") else DEFAULT_HIDDEN_DIM,
+        }
+
         try:
-            # 저장할 데이터 구성
-            checkpoint = {
-                "episode": episode,
-                "model_state_dict": self.policy.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "best_reward": self.best_reward,
-            }
-
-            # EMA 모델이 있으면 함께 저장
-            if self.use_ema:
-                checkpoint["ema_model_state_dict"] = self.policy_ema.state_dict()
-
-            # obs_rms 있으면 함께 저장 (past.py 스타일)
-            if self.obs_rms is not None:
-                checkpoint.update({
-                    'obs_rms_mean': self.obs_rms.mean,
-                    'obs_rms_var': self.obs_rms.var,
-                    'obs_rms_count': self.obs_rms.count,
-                })
-
-            # 파일 저장
-            torch.save(checkpoint, save_file)
+            # 모델 저장
+            torch.save(save_dict, save_file)
             self.logger.info(f"모델 저장 완료: {save_file} (보상: {reward:.4f})")
             return True
         except Exception as e:
             self.logger.error(f"모델 저장 중 오류 발생: {e}")
-            self.logger.error(traceback.format_exc())
+            traceback.print_exc()
             return False
 
     def load_model(self, model_file=None):
-        """저장된 모델 파일에서 가중치와 옵티마이저 상태를 불러옵니다."""
-        if model_file is None:
-            model_file = os.path.join(self.model_path, "best_model.pth")
+        """
+        저장된 모델을 로드합니다.
 
-        if not os.path.isfile(model_file):
-            self.logger.warning(f"모델 파일을 찾을 수 없음: {model_file}")
+        Args:
+            model_file: 로드할 모델 파일 경로
+
+        Returns:
+            bool: 로드 성공 여부
+        """
+        if model_file is None:
+            # 모델 파일 자동 선택
+            # 먼저 best_model.pth 찾기
+            best_model_path = os.path.join(self.model_path, "best_model.pth")
+            if os.path.exists(best_model_path):
+                model_file = best_model_path
+            else:
+                # 없으면 가장 최근 체크포인트 찾기
+                checkpoint_dir = os.path.join(self.model_path, "checkpoints")
+                if os.path.exists(checkpoint_dir):
+                    checkpoints = [
+                        os.path.join(checkpoint_dir, f)
+                        for f in os.listdir(checkpoint_dir)
+                        if f.startswith("model_ep") and f.endswith(".pth")
+                    ]
+                    if checkpoints:
+                        # 에피소드 번호 기준 정렬
+                        checkpoints.sort(
+                            key=lambda x: int(
+                                os.path.basename(x)
+                                .replace("model_ep", "")
+                                .replace(".pth", "")
+                            )
+                        )
+                        model_file = checkpoints[-1]  # 가장 최근 체크포인트
+
+        if model_file is None or not os.path.exists(model_file):
+            self.logger.error(f"모델 파일을 찾을 수 없음: {model_file}")
             return False
 
         try:
-            # 장치 확인 (CPU 또는 GPU)
-            map_location = torch.device("cpu") if not torch.cuda.is_available() else None
-            checkpoint = torch.load(model_file, map_location=map_location)
-
-            # 모델 가중치 불러오기
-            self.policy.load_state_dict(checkpoint["model_state_dict"])
-            self.policy_old.load_state_dict(checkpoint["model_state_dict"])
-
-            # EMA 모델 불러오기 (있는 경우)
-            if self.use_ema and "ema_model_state_dict" in checkpoint:
-                self.policy_ema.load_state_dict(checkpoint["ema_model_state_dict"])
-            elif self.use_ema:
-                # EMA 모델 가중치가 없으면 현재 정책으로 초기화
-                self.policy_ema.load_state_dict(self.policy.state_dict())
-
-            # 옵티마이저 상태 불러오기 (있는 경우)
-            if "optimizer_state_dict" in checkpoint:
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-            # 관측 정규화 통계 불러오기 (past.py 스타일)
-            if 'obs_rms_mean' in checkpoint and 'obs_rms_var' in checkpoint and 'obs_rms_count' in checkpoint:
-                if self.obs_rms is None:
-                    # self.obs_rms = RunningMeanStd(shape=(self.n_assets, self.n_features)) # 여기서 shape을 알아야 함.
-                    # n_features는 __init__에서 받고, n_assets도 받음.
-                    # RunningMeanStd는 actor_critic 내부가 아니라 env에 있어야 함.
-                    # 환경의 obs_rms를 PPO가 참조하거나, PPO가 직접 관리한다면 shape 정보 필요.
-                    # past.py에서는 PPO가 obs_rms를 직접 관리했음.
-                    # 여기서는 PPO.__init__에서 self.n_assets, self.n_features를 알고 있으므로 사용 가능.
-                    self.obs_rms = RunningMeanStd(shape=(self.n_assets, self.n_features))
-                self.obs_rms.mean = checkpoint['obs_rms_mean']
-                self.obs_rms.var = checkpoint['obs_rms_var']
-                self.obs_rms.count = checkpoint['obs_rms_count']
-                self.logger.info("저장된 상태 정규화(obs_rms) 통계 로드 완료.")
-            else:
-                # obs_rms 정보가 없는 경우, None으로 유지하거나 새로 생성하지 않음.
-                # 학습 시작 시 환경에서 obs_rms를 가져오거나, 새로 생성해야 함.
-                self.obs_rms = None # 명시적으로 None 처리
-
-            self.best_reward = checkpoint.get("best_reward", self.best_reward)
-            episode = checkpoint.get("episode", 0)
-
-            self.logger.info(
-                f"모델 불러오기 완료: {model_file} "
-                f"(에피소드: {episode}, 최고 보상: {self.best_reward:.4f})"
-            )
+            # 모델 로드
+            state_dict = torch.load(model_file, map_location=DEVICE)
+            
+            # 모델 구조 검증
+            saved_n_assets = state_dict.get("n_assets", self.n_assets)
+            saved_n_features = state_dict.get("n_features", self.n_features)
+            
+            if saved_n_assets != self.n_assets or saved_n_features != self.n_features:
+                self.logger.warning(
+                    f"모델 구조 불일치: 저장된 모델({saved_n_assets} 자산, {saved_n_features} 피처) vs "
+                    f"현재 모델({self.n_assets} 자산, {self.n_features} 피처)"
+                )
+                # 구조 불일치 시 모델 재생성
+                hidden_dim = state_dict.get("hidden_dim", DEFAULT_HIDDEN_DIM)
+                self.policy = ActorCritic(self.n_assets, self.n_features, hidden_dim).to(DEVICE)
+                self.policy_old = ActorCritic(self.n_assets, self.n_features, hidden_dim).to(DEVICE)
+                
+                if self.use_ema:
+                    self.policy_ema = ActorCritic(self.n_assets, self.n_features, hidden_dim).to(DEVICE)
+                    for param in self.policy_ema.parameters():
+                        param.requires_grad = False
+                
+                self.logger.info(f"모델 구조 조정: {hidden_dim} 은닉층 차원으로 재생성됨")
+                
+                # 가중치 초기화만 진행하고 로딩은 무시
+                self._init_weights()
+                return True
+            
+            # 모델 가중치 로드
+            self.policy.load_state_dict(state_dict["model_state_dict"])
+            self.policy_old.load_state_dict(state_dict["model_state_dict"])
+            
+            if self.use_ema:
+                self.policy_ema.load_state_dict(state_dict["model_state_dict"])
+            
+            # 옵티마이저 상태 로드 (있는 경우)
+            if "optimizer_state_dict" in state_dict:
+                try:
+                    self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
+                except Exception as e:
+                    self.logger.warning(f"옵티마이저 상태 로드 실패: {e}, 새로운 옵티마이저 사용")
+            
+            # RMS 통계 로드 (있는 경우)
+            if "obs_rms" in state_dict and state_dict["obs_rms"] is not None:
+                self.obs_rms = state_dict["obs_rms"]
+            
+            # 모델 로드 성공
+            reward = state_dict.get("reward", "알 수 없음")
+            episode = state_dict.get("episode", "알 수 없음")
+            self.logger.info(f"모델 로드 성공: {model_file} (에피소드: {episode}, 보상: {reward})")
+            
             return True
+        
         except Exception as e:
-            self.logger.error(f"모델 불러오기 중 오류 발생: {e}")
-            self.logger.error(traceback.format_exc())
+            self.logger.error(f"모델 로드 중 오류: {e}")
+            traceback.print_exc()
             return False
 
     def select_action(self, state, use_ema=True):
         """
-        현재 상태에서 행동을 선택합니다.
-        주로 테스트 또는 시뮬레이션 중에 사용됩니다.
-        """
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
-
-            # EMA 모델이 있고 사용 설정이 켜져 있으면 EMA 모델 사용
-            if self.use_ema and use_ema:
-                action_probs, _ = self.policy_ema(state_tensor)
-            else:
-                action_probs, _ = self.policy_old(state_tensor)
-
-            dist = torch.distributions.Categorical(action_probs)
-            action_idx = dist.sample()
-
-            # 원-핫 인코딩으로 변환
-            action = torch.zeros_like(action_probs)
-            action.scatter_(1, action_idx.unsqueeze(-1), 1.0)
-
-        return action.squeeze(0).cpu().numpy()
-
-    def compute_returns_and_advantages(self, rewards, is_terminals, values):
-        """
-        Generalized Advantage Estimation (GAE)를 사용하여 Advantage와 Return을 계산합니다.
+        주어진 상태에서 행동을 선택합니다.
 
         Args:
-            rewards (list): 에피소드/배치에서 얻은 보상 리스트.
-            is_terminals (list): 각 스텝의 종료 여부 리스트.
-            values (np.ndarray): 각 상태에 대한 크리틱의 가치 예측값 배열.
+            state: 환경의 현재 상태
+            use_ema: EMA 모델 사용 여부
 
         Returns:
-            tuple: (returns_tensor, advantages_tensor)
-                   - returns_tensor (torch.Tensor): 계산된 Return (Target Value).
-                   - advantages_tensor (torch.Tensor): 계산된 Advantage.
-                   오류 발생 시 빈 텐서 반환.
+            np.ndarray: 선택된 행동
         """
-        if not rewards or values.size == 0:
-            self.logger.warning("GAE 계산 시 rewards 또는 values 배열이 비어있습니다.")
-            return torch.tensor([], device=DEVICE), torch.tensor([], device=DEVICE)
+        if use_ema and self.use_ema:
+            model = self.policy_ema
+        else:
+            model = self.policy_old
 
-        returns = np.zeros_like(rewards, dtype=np.float32)
-        advantages = np.zeros_like(rewards, dtype=np.float32)
-        last_gae_lam = 0.0
+        with torch.no_grad():
+            state = torch.FloatTensor(state).to(DEVICE)
+            state = state.unsqueeze(0)  # 배치 차원 추가
+            action, _, _ = model.act(state)
 
-        next_value = values[-1] * (1.0 - float(is_terminals[-1]))
+        return action
 
-        for i in reversed(range(len(rewards))):
-            mask = 1.0 - float(is_terminals[i])
-            delta = rewards[i] + self.gamma * next_value * mask - values[i]
-            last_gae_lam = delta + self.gamma * LAMBDA_GAE * mask * last_gae_lam
-            advantages[i] = last_gae_lam
-            returns[i] = last_gae_lam + values[i]
-            next_value = values[i]
+    def compute_returns_and_advantages(self, memory):
+        """
+        GAE(Generalized Advantage Estimation)를 사용하여 returns와 advantages를 계산합니다.
 
-        try:
-            returns_tensor = torch.from_numpy(returns).float().to(DEVICE)
-            advantages_tensor = torch.from_numpy(advantages).float().to(DEVICE)
-        except Exception as e:
-            self.logger.error(f"Return/Advantage 텐서 변환 중 오류: {e}")
-            return torch.tensor([], device=DEVICE), torch.tensor([], device=DEVICE)
+        Args:
+            memory: 학습 데이터가 담긴 메모리 객체
 
-        if torch.isnan(returns_tensor).any() or torch.isinf(returns_tensor).any():
-            returns_tensor = torch.nan_to_num(returns_tensor, nan=0.0)
-        if torch.isnan(advantages_tensor).any() or torch.isinf(advantages_tensor).any():
-            advantages_tensor = torch.nan_to_num(advantages_tensor, nan=0.0)
-
-        return returns_tensor, advantages_tensor
+        Returns:
+            tuple: (returns, advantages) 배열
+        """
+        # 메모리에서 데이터 추출
+        rewards = memory.rewards
+        is_terminals = memory.is_terminals
+        values = memory.values
+        
+        returns = []
+        advantages = []
+        gae = 0
+        
+        # GAE 계산
+        for step in reversed(range(len(rewards))):
+            # 마지막 스텝이거나 에피소드가 종료된 경우, next_value는 0
+            if step == len(rewards) - 1 or is_terminals[step]:
+                next_value = 0
+            else:
+                next_value = values[step + 1]
+            
+            # TD 에러 계산
+            delta = rewards[step] + self.gamma * next_value * (1 - is_terminals[step]) - values[step]
+            
+            # GAE(Generalized Advantage Estimation) 계산
+            gae = delta + self.gamma * self.gae_lambda * (1 - is_terminals[step]) * gae
+            
+            # 장점과 반환값 계산
+            advantages.insert(0, gae)
+            returns.insert(0, gae + values[step])
+        
+        # 계산된 returns과 advantages를 텐서로 변환
+        returns = torch.tensor(returns, dtype=torch.float32).to(DEVICE)
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(DEVICE)
+        
+        # Advantages 정규화 (학습 안정성 향상)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        return returns, advantages
 
     def update(self, memory):
-        """ 메모리에 저장된 경험을 사용하여 정책(policy)을 업데이트합니다. """
-        if not memory.states:
-            self.logger.warning("업데이트 시도: 메모리가 비어있습니다.")
+        """
+        메모리에 있는 데이터를 사용하여 정책을 업데이트합니다.
+
+        Args:
+            memory: 학습 데이터가 담긴 메모리 객체
+
+        Returns:
+            float: 평균 손실값
+        """
+        # 경험 부족 시 건너뛰기
+        if len(memory.states) < self.batch_size:
+            self.logger.warning(f"경험 부족으로 업데이트 건너뜀 (필요: {self.batch_size}, 현재: {len(memory.states)})")
             return 0.0
 
-        total_loss_val = 0.0 # total_loss_val 초기화
-        # total_actor_loss = 0.0 # 이 변수들은 현재 사용되지 않으므로 주석 처리 또는 삭제 가능
-        # total_critic_loss = 0.0
-        # total_entropy = 0.0
+        # GAE를 사용하여 returns와 advantages 계산
+        returns, advantages = self.compute_returns_and_advantages(memory)
+
+        # 데이터 준비
+        old_states = torch.FloatTensor(np.array(memory.states)).to(DEVICE)
+        old_actions = torch.FloatTensor(np.array(memory.actions)).to(DEVICE)
+        old_logprobs = torch.FloatTensor(np.array(memory.logprobs)).to(DEVICE)
         
-        try:
-            # 1. 메모리에서 데이터 로드
-            old_states = torch.stack([torch.from_numpy(s).float() for s in memory.states]).to(DEVICE)
-            old_actions = torch.stack([torch.from_numpy(a).float() for a in memory.actions]).to(DEVICE)
-            old_logprobs = torch.tensor(memory.logprobs, dtype=torch.float32).to(DEVICE)
-            old_values = torch.tensor(memory.values, dtype=torch.float32).to(DEVICE)
+        # 배치 인덱스 생성
+        batch_size = self.batch_size
+        indices = np.arange(len(old_states))
+        
+        # 여러 에포크 동안 미니배치로 학습
+        total_loss = 0
+        total_policy_loss = 0
+        total_value_loss = 0
+        total_entropy = 0
+        n_updates = 0
+        
+        # 현재 학습률 확인
+        current_lr = self.optimizer.param_groups[0]['lr']
+        if current_lr < 1e-6:
+            self.logger.warning(f"학습률이 매우 낮음: {current_lr:.8f}, 업데이트 건너뜀")
+            return 0.0
+        
+        self.policy.train()
+        
+        for epoch in range(self.k_epochs):
+            # 인덱스 셔플
+            np.random.shuffle(indices)
             
-            # 원시 보상 사용 (메모리 재사용 문제 해결)
-            rewards = memory.get_raw_rewards_tensor().to(DEVICE)
-            
-            # 2. GAE 계산
-            old_values_np = old_values.cpu().numpy()
-            returns, advantages = self.compute_returns_and_advantages(
-                memory.raw_rewards, memory.is_terminals, old_values_np
-            )
-
-            if returns.numel() == 0 or advantages.numel() == 0:
-                self.logger.error("GAE 계산 실패로 PPO 업데이트 중단.")
-                return 0.0
-
-            # 3. Advantage 정규화
-            adv_mean = advantages.mean()
-            adv_std = advantages.std()
-            advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-
-            if torch.isnan(advantages).any() or torch.isinf(advantages).any():
-                self.logger.warning("Advantage 정규화 후 NaN/Inf 발견. 0으로 대체.")
-                advantages = torch.nan_to_num(advantages, nan=0.0)
-
-            # PPO 업데이트 루프
-            for _ in range(self.k_epochs):
-                logprobs, entropy, state_values = self.policy.evaluate(
-                    old_states, old_actions
-                )
-                ratios = torch.exp(logprobs - old_logprobs.detach())
+            # 미니배치 반복
+            for start_idx in range(0, len(indices), batch_size):
+                # 배치 인덱스 선택
+                idx = indices[start_idx:start_idx + batch_size]
                 
-                # Surrogate 손실 계산
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                # 배치 데이터 추출
+                batch_states = old_states[idx]
+                batch_actions = old_actions[idx]
+                batch_logprobs = old_logprobs[idx]
+                batch_returns = returns[idx]
+                batch_advantages = advantages[idx]
                 
-                # 액터, 크리틱, 엔트로피 손실 계산 (past.py 스타일 계수 적용)
-                actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = self.MseLoss(state_values, returns) # MSELoss는 __init__에서 정의됨
-                entropy_loss = entropy.mean()
+                # 현재 정책의 로그 확률 및 엔트로피, 상태 가치 계산
+                logprobs, state_values, dist_entropy = self.policy.evaluate(batch_states, batch_actions)
                 
-                # 총 손실
-                # loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy_loss
-                loss = actor_loss + 0.5 * critic_loss - self.entropy_coef * entropy_loss  # 설정된 엔트로피 계수 사용
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    self.logger.error(
-                        f"손실 계산 중 NaN/Inf 발생! Actor: {actor_loss.item()}, "
-                        f"Critic: {critic_loss.item()}, Entropy: {entropy_loss.item()}. "
-                        f"해당 배치 업데이트 건너<0xEB><0x9A><0x8D>니다."
-                    )
-                    total_loss_val = 0.0 # 에러 시 이전 손실 누적 방지
-                    break  # 현재 배치 업데이트 중단
-
+                # 비율 계산 (importance sampling)
+                ratios = torch.exp(logprobs - batch_logprobs.detach())
+                
+                # PPO 정책 손실 계산 (클리핑 적용)
+                surr1 = ratios * batch_advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # 가치 함수 손실 계산
+                value_loss = self.critic_coef * self.MseLoss(state_values, batch_returns)
+                
+                # 엔트로피 보너스 (탐색 촉진)
+                entropy_loss = -self.entropy_coef * dist_entropy.mean()
+                
+                # 전체 손실 계산
+                loss = policy_loss + value_loss + entropy_loss
+                
+                # 그래디언트 계산 및 업데이트
                 self.optimizer.zero_grad()
                 loss.backward()
-                # torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=GRADIENT_CLIP)
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5) # past.py max_norm 직접 사용
+                
+                # 그래디언트 클리핑 (선택적)
+                if self.clip_grad_norm:
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.gradient_clip)
+                
                 self.optimizer.step()
                 
-                # 온도 파라미터 업데이트 (past.py와 동일하게 epoch 루프 내 위치)
-                self.policy.update_temperature()
-
-                # EMA 모델 가중치 업데이트
-                if self.use_ema:
-                    self.update_ema_model()
-                
-                total_loss_val += loss.item()
-                
-            # 가비지 컬렉션 (메모리 관리 강화)
-            # gc.collect()
-            # if DEVICE.type == 'cuda':
-            #     torch.cuda.empty_cache()
-
-
-            # 이전 정책 업데이트
-            if total_loss_val != 0.0 or self.k_epochs == 0: # 손실이 0이 아니거나 에폭이 0일 때만 업데이트
-                self.policy_old.load_state_dict(self.policy.state_dict())
-                # 평균 손실 반환
-                return total_loss_val / self.k_epochs if self.k_epochs > 0 else 0.0
-            else: # 손실이 0이면 (예: NaN 발생으로 업데이트 건너뛴 경우) 0.0 반환
-                return 0.0
-
-        except Exception as e:
-            self.logger.error(f"PPO 업데이트 중 예상치 못한 오류 발생: {e}")
-            self.logger.error(traceback.format_exc())
-            return 0.0 
+                # 손실 누적
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += dist_entropy.mean().item()
+                total_loss += loss.item()
+                n_updates += 1
+        
+        # 구 정책을 새 정책으로 업데이트
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        # EMA 모델 업데이트
+        if self.use_ema:
+            self.update_ema_model()
+        
+        # 평균 손실 계산
+        avg_loss = total_loss / max(1, n_updates)
+        avg_policy_loss = total_policy_loss / max(1, n_updates)
+        avg_value_loss = total_value_loss / max(1, n_updates)
+        avg_entropy = total_entropy / max(1, n_updates)
+        
+        # 손실 로깅 (낮은 레벨로)
+        self.logger.debug(
+            f"PPO 업데이트 완료: 손실={avg_loss:.4f}, 정책손실={avg_policy_loss:.4f}, "
+            f"가치손실={avg_value_loss:.4f}, 엔트로피={avg_entropy:.4f}, 배치={n_updates}개"
+        )
+        
+        return avg_loss 

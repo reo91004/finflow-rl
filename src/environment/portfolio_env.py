@@ -113,32 +113,66 @@ class StockPortfolioEnv(gym.Env):
         # 시장 변동성 추적 (가변 클리핑용)
         self.market_volatility_window = []
         self.volatility_scaling = 1.0  # 기본값은 1.0 (표준 클리핑)
+        
+        # 초기화 시 적용할 배치 크기
+        self.initial_batch_size = 100
 
     def _normalize_obs(self, obs):
         """관측값을 정규화합니다."""
         if not self.normalize_states or self.obs_rms is None:
             return obs
-        # RunningMeanStd 업데이트 (차원 맞추기)
-        self.obs_rms.update(obs.reshape(1, self.n_assets, self.n_features))
+        
+        # 관측값을 배치 형태로 변환
+        obs_batch = obs.reshape(1, self.n_assets, self.n_features)
+        
+        # 초기화 단계에서는 더 큰 배치로 통계 누적
+        if self.current_step < self.initial_batch_size:
+            # 초기 통계 구축을 위한 인공 배치 생성
+            noise_scale = 0.01  # 적은 노이즈 추가
+            artificial_batch = obs + np.random.normal(0, noise_scale, size=obs.shape)
+            artificial_batch = artificial_batch.reshape(1, self.n_assets, self.n_features)
+            # RunningMeanStd 업데이트
+            self.obs_rms.update(artificial_batch)
+        
+        # 정규화를 위한 통계 업데이트
+        if self.current_step % 5 == 0:  # 5스텝마다 업데이트 (갱신 빈도 조절)
+            self.obs_rms.update(obs_batch)
+        
         # 정규화 및 클리핑
-        return np.clip(
+        normalized_obs = np.clip(
             (obs - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + RMS_EPSILON),
             -CLIP_OBS,
             CLIP_OBS,
         )
+        
+        return normalized_obs
 
     def _normalize_reward(self, reward):
         """보상을 정규화합니다."""
         if not self.normalize_states or self.ret_rms is None:
-            return reward
+            # 정규화하지 않는 경우에도 일정 범위로 클리핑
+            return np.clip(reward, REWARD_CLIP_MIN, REWARD_CLIP_MAX)
+            
+        # 음수 보상에 대한 가중치 적용
+        if reward < 0:
+            reward = reward * REWARD_NEGATIVE_WEIGHT
+        
         # 누적 할인 보상 업데이트
         self.returns_norm = self.gamma * self.returns_norm + reward
-        # RunningMeanStd 업데이트
-        self.ret_rms.update(self.returns_norm)
-        # 정규화 및 클리핑
-        return np.clip(
-            reward / np.sqrt(self.ret_rms.var + RMS_EPSILON), -CLIP_REWARD, CLIP_REWARD
+        
+        # 보상 정규화 통계 업데이트 (5스텝마다)
+        if self.current_step % 5 == 0:
+            self.ret_rms.update(np.array([self.returns_norm]))
+        
+        # 보상 정규화 및 클리핑
+        std = np.sqrt(self.ret_rms.var + RMS_EPSILON)
+        normalized_reward = np.clip(
+            reward / std, 
+            REWARD_CLIP_MIN, 
+            REWARD_CLIP_MAX
         )
+        
+        return normalized_reward
 
     def _calculate_sharpe_ratio(self, window_size=REWARD_SHARPE_WINDOW):
         """
@@ -164,6 +198,16 @@ class StockPortfolioEnv(gym.Env):
         recent_returns = [r for r in recent_returns_raw if np.isfinite(r)]
         if len(recent_returns) < 2: # 유효한 데이터가 2개 미만이면 0 반환
             return 0.0
+            
+        # 이상치 제거 (3시그마 룰 적용)
+        mean = np.mean(recent_returns)
+        std = np.std(recent_returns)
+        if std > 0:
+            lower_bound = mean - 3 * std
+            upper_bound = mean + 3 * std
+            filtered_returns = [r for r in recent_returns if lower_bound <= r <= upper_bound]
+            if len(filtered_returns) >= 2:
+                recent_returns = filtered_returns
 
         # 평균 수익률과 표준편차 계산
         mean_return = np.mean(recent_returns)
@@ -179,7 +223,7 @@ class StockPortfolioEnv(gym.Env):
         # 연율화 (252 거래일 기준)
         annualized_sharpe = daily_sharpe * np.sqrt(252)
         
-        # Sharpe ratio 클리핑 (3.0 → 2.0으로 감소)
+        # Sharpe ratio 클리핑
         clipped_sharpe = np.clip(annualized_sharpe, -SHARPE_RATIO_CLIP, SHARPE_RATIO_CLIP)
 
         return clipped_sharpe
@@ -248,305 +292,279 @@ class StockPortfolioEnv(gym.Env):
                     0, max_start_index + 1
                 )  # 0부터 시작 가능하도록 +1
         elif start_index >= self.n_steps:
-            logger.warning(
-                f"제공된 시작 인덱스({start_index})가 데이터 범위({self.n_steps})를 벗어남. 0으로 설정."
-            )
-            start_index = 0
+            start_index = max(0, self.n_steps - 1)
+            logger.warning(f"시작 인덱스가 데이터 길이를 초과하여 {start_index}로 조정됨")
 
         self.current_step = start_index
-
-        # 내부 상태 초기화
         self.cash = self.initial_cash
-        self.holdings.fill(0)
-        self.portfolio_value = self.cash
-        self.weights = np.ones(self.n_assets + 1) / (
-            self.n_assets + 1
-        )  # 현금 포함 균등 비중
+        self.holdings = np.zeros(self.n_assets, dtype=np.float32)
+        self.portfolio_value = self.initial_cash
+        self.weights = np.zeros(self.n_assets + 1, dtype=np.float32)
+        self.weights[0] = 1.0  # 처음에는 전부 현금
         self.prev_weights = self.weights.copy()
 
-        # 보상 정규화 관련 변수 초기화
-        if self.normalize_states:
-            self.returns_norm = np.zeros(1)
-
-        # K-일 보상 누적 이력 초기화
+        # 이력 비우기
         self.portfolio_value_history = [self.portfolio_value]
-
-        # 수익률 이력 초기화
         self.returns_history = []
-
-        # 최대 가치 초기화
         self.max_portfolio_value = self.portfolio_value
-
-        # 시장 변동성 초기화
         self.market_volatility_window = []
         self.volatility_scaling = 1.0
 
-        # 초기 관측값 반환
-        observation = self._get_observation()
-        normalized_observation = self._normalize_obs(observation)
-        info = self._get_info()  # 초기 정보 생성
+        # 정규화 통계 초기화
+        if self.normalize_states and self.ret_rms is not None:
+            self.returns_norm = np.zeros(1)  # 누적 보상 초기화
 
-        return normalized_observation.astype(np.float32), info
+        # 초기 관측 반환
+        obs = self._get_observation()
+        info = self._get_info()
 
+        return obs, info
+        
     def _get_observation(self):
-        """현재 스텝의 원본 관측 데이터를 반환합니다."""
-        # 데이터 인덱스 범위 확인 (방어 코드)
-        step = min(self.current_step, self.n_steps - 1)  # 범위를 벗어나지 않도록 조정
-        return self.data[step]
+        """현재 상태에 대한 관측값을 반환합니다."""
+        observation = self.data[self.current_step].copy()
+        return self._normalize_obs(observation)
 
     def _get_info(self):
-        """현재 환경 상태 정보를 담은 딕셔너리를 반환합니다."""
+        """현재 상태에 대한 부가 정보를 반환합니다."""
         return {
             "portfolio_value": self.portfolio_value,
             "cash": self.cash,
             "holdings": self.holdings.copy(),
             "weights": self.weights.copy(),
-            "return": 0.0,  # 초기 상태에서는 수익률 0
-            "raw_reward": 0.0,  # 초기 상태에서는 보상 0
+            "current_step": self.current_step,
+            "max_value": self.max_portfolio_value,
+            "drawdown": self._calculate_drawdown(),
+            "return": 0.0 if len(self.returns_history) == 0 else self.returns_history[-1],
+            "sharpe_ratio": self._calculate_sharpe_ratio(),
         }
 
     def step(self, action):
         """
-        환경을 한 스텝 진행합니다.
+        주어진 행동(포트폴리오 비중)에 따라 환경을 한 스텝 진행합니다.
 
         Args:
-            action (np.ndarray): 각 자산에 할당할 포트폴리오 비중 (0~1 사이, 합이 1)
+            action (np.ndarray): 각 자산의 목표 비중 (n_assets + 1 크기 배열, 합계 1)
 
         Returns:
-            observation: 다음 상태 관측값
-            reward: 수익률 기반 보상값
-            terminated: 에피소드 종료 여부
-            truncated: 최대 스텝 도달 등으로 인한 인위적 종료 여부
-            info: 추가 정보 딕셔너리
+            tuple: (관측, 보상, 종료여부, 절단여부, 정보)
         """
-        # 현재 스텝 인덱스 증가
-        self.current_step += 1
-
-        # 현재 상태 및 가격 정보
-        obs = self._get_observation()
-        current_prices = np.maximum(obs[:, 3], 1e-6)  # 종가를 사용하고 0으로 나눔 방지
-
-        # 이전 비중 저장 (행동 변화 페널티 계산용)
-        # 현금 포함 비중 계산 (현금은 마지막 인덱스)
-        self.prev_weights = self.weights.copy()
-
-        # 행동 검증 (0~1 사이 값으로 제한)
-        action = np.clip(action, 0, 1)
-        
-        # 행동이 합이 1이 되도록 정규화
-        if np.sum(action) > 0:
-            action = action / np.sum(action)
+        # 유효한 행동인지 확인
+        if not isinstance(action, np.ndarray):
+            action = np.array(action, dtype=np.float32)
+            
+        # 행동이 음수면 0으로 클리핑
+        action = np.clip(action, 0.0, 1.0)
+            
+        # 합이 1이 되도록 정규화
+        action_sum = np.sum(action)
+        if action_sum > 0:
+            action = action / action_sum
         else:
-            # 모든 값이 0인 경우 균등 배분
-            action = np.ones_like(action) / action.shape[0]
+            # 모든 비중이 0이면 모두 현금으로
+            action = np.zeros_like(action)
+            action[0] = 1.0
 
         # 이전 포트폴리오 가치 저장
         prev_portfolio_value = self.portfolio_value
-        prev_value_safe = max(prev_portfolio_value, 1e-8)  # 0으로 나누기 방지
 
-        # 이전 포트폴리오 가치 이력 저장
-        self.portfolio_value_history.append(prev_portfolio_value)
+        # 현재 주가 가져오기
+        current_prices = self.data[self.current_step, :, 3]  # Close 가격 사용
+
+        # 목표 자산 배분에 따라 거래 실행
+        self._execute_trades(action, current_prices)
+
+        # 포트폴리오 이력 추가
+        self.portfolio_value_history.append(self.portfolio_value)
+
+        # 다음 스텝으로 이동
+        self.current_step += 1
+
+        # 포트폴리오 수익률 계산
+        raw_return = (self.portfolio_value / prev_portfolio_value) - 1.0
+        self.returns_history.append(raw_return)
 
         # 최대 포트폴리오 가치 업데이트
-        self.max_portfolio_value = max(self.max_portfolio_value, prev_portfolio_value)
-        
-        # 최근 K일 가치만 유지
-        if len(self.portfolio_value_history) > REWARD_ACCUMULATION_DAYS + 1:
-            self.portfolio_value_history.pop(0)
-
-        # 파산 조건 확인
-        if prev_portfolio_value <= 1e-6:
-            terminated = True
-            truncated = False
-            raw_reward = -10.0  # 파산 시 큰 음수 보상
-            info = {
-                "portfolio_value": 0.0, "cash": 0.0, "holdings": self.holdings.copy(),
-                "weights": np.zeros_like(self.weights), "return": -1.0, "raw_reward": raw_reward
-            }
-            # 마지막 관측값은 현재 관측값 사용 (정규화)
-            last_obs_norm = self._normalize_obs(obs)
-            reward_norm = self._normalize_reward(raw_reward)
-            return last_obs_norm.astype(np.float32), float(reward_norm), terminated, truncated, info
-
-        # 거래 실행
-        # 각 자산의 목표 가치 계산
-        target_value_allocation = action[:-1] * prev_portfolio_value
-        
-        # 실제 거래 실행 (매수/매도)
-        self._execute_trades(target_value_allocation, current_prices)
-
-        # 최대 스텝 도달 또는 에피소드 종료 여부 확인
-        terminated = False
-        if self.current_step >= self.n_steps - 1:
-            terminated = True  # 데이터의 끝에 도달
-
-        # 포트폴리오 가치가 초기 자본금의 일정 비율 이하로 떨어지면 종료
-        if self.portfolio_value < self.initial_cash * 0.2:  # 원금의 20% 이하면 종료
-            terminated = True
-
-        # 다음 스텝 데이터 설정 및 보상 계산
-        truncated = False  # Truncated는 학습 루프에서 max_episode_length 도달 시 설정
-
-        # 다음 스텝 관측 및 새 포트폴리오 가치 계산
-        if terminated:
-            next_obs_raw = obs  # 마지막 관측값 사용 (정규화 안된 것)
-        else:
-            next_obs_raw = self.data[self.current_step]
-
-        next_prices = next_obs_raw[:, 3]  # 다음 날 종가
-        next_prices = np.maximum(next_prices, 1e-6)  # 0 가격 방지
-        new_portfolio_value = self.cash + np.dot(self.holdings, next_prices)
-
-        # 수익률 계산 및 이력 업데이트
-        prev_value_safe = max(prev_portfolio_value, 1e-8)  # 이전 가치가 0에 가까울 때 대비
-        current_value_safe = max(new_portfolio_value, 0.0)  # 현재 가치는 0이 될 수 있음
-        daily_return = (current_value_safe / prev_value_safe) - 1
-        self.returns_history.append(daily_return)
-        
-        # 포트폴리오 가치 업데이트
-        self.portfolio_value = new_portfolio_value
-
-        # 자산 비중 업데이트
-        if self.portfolio_value > 1e-8:
-            stock_weights = (self.holdings * next_prices) / self.portfolio_value  # 주식 비중
-            cash_weight = self.cash / self.portfolio_value  # 현금 비중
-            self.weights = np.append(stock_weights, cash_weight)
-        else:
-            self.weights = np.zeros(self.n_assets + 1)
+        if self.portfolio_value > self.max_portfolio_value:
+            self.max_portfolio_value = self.portfolio_value
             
-        # 이전 가중치 저장 (다음 스텝의 변화 페널티 계산용)
-        self.prev_weights = self.weights.copy()
-
-        # 시장 변동성 업데이트 (최근 수익률의 표준편차)
-        if len(self.returns_history) > 1:
-            window_size = min(20, len(self.returns_history))
-            recent_vol = np.std(self.returns_history[-window_size:])
-            self.market_volatility_window.append(recent_vol)
-            # 최근 변동성만 저장
-            if len(self.market_volatility_window) > 100:  # 충분히 긴 이력 유지
-                self.market_volatility_window.pop(0)
+        # 가격 변동성 추적 (현재 데이터의 일일 변동성)
+        if self.current_step > 0:
+            yesterday_close = self.data[self.current_step - 1, :, 3]  # 전일 종가
+            today_close = self.data[self.current_step, :, 3]  # 당일 종가
+            returns = (today_close / yesterday_close) - 1.0  # 수익률
+            volatility = np.std(returns)  # 변동성 (전체 자산의 표준편차)
+            self.market_volatility_window.append(volatility)
             
-            # 변동성 기반 클리핑 스케일 업데이트
+            # 변동성에 따른 보상 스케일링 값 업데이트
             self.volatility_scaling = self._calculate_volatility_scaling()
         
-        # --- 단순화된 보상 계산 (개선된 버전) ---
-        
-        # 1. 포트폴리오 가치 변화율 (로그 수익률)
-        prev_value_safe = max(prev_portfolio_value, 1e-8)
-        current_value_safe = max(self.portfolio_value, 0.0)
-        
-        log_return = np.log(current_value_safe / prev_value_safe) if prev_value_safe > 0 and current_value_safe > 0 else 0.0
-        
-        # 2. 거래 비용 페널티 (action_change_penalty는 그대로 사용하되 약간 줄임)
-        weight_changes = np.abs(action - self.prev_weights)
-        threshold = 0.02  # 작은 변화는 무시
-        significant_changes = np.where(weight_changes > threshold, weight_changes, 0.0)
-        action_change_penalty = 0.001 * np.sum(significant_changes)  # 페널티 계수 약간 줄여봄 (0.002 -> 0.001)
-        
-        # 3. 단순화된 raw_reward
-        raw_reward = log_return - action_change_penalty
-        
-        # NaN/Inf 처리는 유지
-        if np.isnan(raw_reward) or np.isinf(raw_reward):
-            raw_reward = -1.0 # NaN/Inf 발생 시 페널티 (past.py와 동일)
+        # 행동 변화 페널티 계산
+        action_change_penalty = 0.0
+        if self.action_penalty_coef > 0:
+            action_diff = np.abs(action - self.prev_weights).mean()
+            action_change_penalty = self.action_penalty_coef * action_diff
 
-        # 다음 상태 및 보상 정규화
-        next_obs_norm = self._normalize_obs(next_obs_raw)
-        reward_norm = self._normalize_reward(raw_reward) # 정규화된 보상
+        # 기본 보상 계산 (K-일 수익률)
+        if REWARD_ACCUMULATION_DAYS <= 1:
+            # 단일 스텝 보상
+            reward_return = raw_return
+        else:
+            # K-일 누적 보상
+            if len(self.portfolio_value_history) > REWARD_ACCUMULATION_DAYS:
+                k_day_return = (
+                    self.portfolio_value_history[-1] / self.portfolio_value_history[-REWARD_ACCUMULATION_DAYS]
+                ) - 1.0
+                reward_return = k_day_return
+            else:
+                reward_return = raw_return
 
-        # 정보 업데이트 (기존 정보 유지 - 디버깅 목적)
-        info = {
-            "portfolio_value": self.portfolio_value,
-            "cash": self.cash,
-            "holdings": self.holdings.copy(),
-            "weights": self.weights.copy(),
-            "return": daily_return,
-            "raw_reward": raw_reward, # 정규화 이전의 원본 보상
-            "log_return_reward_component": log_return, # 디버깅용
-            "action_penalty": action_change_penalty,
-            # 나머지 정보들은 계산되지 않으므로 주석처리
-            # "k_day_return": k_day_return if "k_day_return" in locals() else 0.0,
-            # "sharpe_ratio": sharpe_ratio,
-            # "drawdown": drawdown,
-            # "volatility_scaling": self.volatility_scaling,
-        }
+        # Sharpe ratio 계산 (안정적인 투자를 위한 변동성 고려)
+        sharpe = self._calculate_sharpe_ratio()
+        
+        # 드로우다운 페널티 계산
+        drawdown = self._calculate_drawdown()
+        drawdown_penalty = REWARD_DRAWDOWN_PENALTY * drawdown if drawdown > 0 else 0.0
+        
+        # 장기 보상 보너스 (지속적인 개선을 위한 누적 수익률)
+        long_term_bonus = 0.0
+        if len(self.returns_history) > 20:  # 최소 20일 이상 데이터가 있을 때
+            # 과거 20일 수익률의 누적 곱
+            cumulative_return = np.prod(1 + np.array(self.returns_history[-20:])) - 1
+            if cumulative_return > 0:
+                long_term_bonus = REWARD_LONG_TERM_BONUS * cumulative_return
 
-        return next_obs_norm.astype(np.float32), float(reward_norm), terminated, truncated, info
+        # 보상 합산
+        reward = (
+            REWARD_RETURN_WEIGHT * reward_return
+            + REWARD_SHARPE_WEIGHT * sharpe
+            - drawdown_penalty
+            - action_change_penalty
+            + long_term_bonus
+        )
+        
+        # 보상 정규화
+        normalized_reward = self._normalize_reward(reward)
+        
+        # 변동성에 따른 보상 스케일링 적용
+        scaled_reward = normalized_reward * self.volatility_scaling
+        
+        # 관측값, 정보, 종료 여부 등 획득
+        observation = self._get_observation()
+        terminated = (self.portfolio_value <= self.initial_cash * 0.1)  # 자산 90% 이상 손실 시 종료
+        truncated = (self.current_step >= min(self.n_steps - 1, start_index + self.max_episode_length))
+        info = self._get_info()
+        
+        # 원시 보상값 정보에 추가
+        info["raw_reward"] = reward
+        info["normalized_reward"] = normalized_reward
+        info["final_reward"] = scaled_reward
+        info["sharpe"] = sharpe
+        info["action_penalty"] = action_change_penalty
+        info["drawdown_penalty"] = drawdown_penalty
+        info["long_term_bonus"] = long_term_bonus
+        
+        # 이전 가중치 업데이트
+        self.prev_weights = action.copy()
+        
+        return observation, scaled_reward, terminated, truncated, info
 
     def _execute_trades(self, target_value_allocation, current_prices):
         """
-        목표 가치 배분에 따라 포트폴리오를 리밸런싱합니다.
-        매수/매도를 실행하고 현금 잔고를 업데이트합니다.
+        목표 자산 배분에 따라 포트폴리오를 재조정합니다.
 
         Args:
-            target_value_allocation (np.ndarray): 각 자산별 목표 가치 배분
-            current_prices (np.ndarray): 현재 자산 가격
+            target_value_allocation (np.ndarray): 목표 자산 비중 (n_assets + 1 크기 배열, 합계 1)
+            current_prices (np.ndarray): 현재 주가 (n_assets 크기 배열)
+
+        Returns:
+            float: 거래 후 포트폴리오 가치
         """
-        # 현재 보유량 기반 가치
-        current_values = self.holdings * current_prices
+        total_value = self.cash + np.sum(self.holdings * current_prices)
+        self.portfolio_value = total_value
 
-        # 리밸런싱 임계값 (포트폴리오 가치의 일정 비율)
-        # 이 임계값보다 작은 가치 변화는 리밸런싱하지 않음 (불필요한 거래 감소)
-        portfolio_value = self.cash + np.sum(current_values)
-        rebalance_threshold = 0.01 * portfolio_value  # 포트폴리오 가치의 1%
+        # 현금 비중
+        cash_ratio = target_value_allocation[0]
+        target_cash = total_value * cash_ratio
 
-        # 매도부터 실행 (현금 확보)
+        # 각 자산의 실제 가치
+        current_asset_values = self.holdings * current_prices
+        
+        # 거래 수수료 추적
+        total_commission = 0.0
+
+        # 거래 실행 (각 자산별로)
         for i in range(self.n_assets):
-            delta_value = target_value_allocation[i] - current_values[i]
-            if delta_value < -rebalance_threshold:  # 임계값보다 크게 매도할 경우만 실행
-                # 매도할 수량 계산 (소수점 이하 잘라내기)
-                sell_amount = np.floor(abs(delta_value) / current_prices[i])
+            # 목표 자산 가치
+            target_value = total_value * target_value_allocation[i + 1]
+            
+            # 현재 보유 자산 가치
+            current_value = current_asset_values[i]
+            
+            # 거래 필요 여부 확인 (1% 이상 차이가 있을 때만 거래)
+            if abs(target_value - current_value) / total_value > 0.01:
+                # 목표 자산 수량
+                target_quantity = target_value / current_prices[i]
                 
-                # 실제 매도 가능한 수량은 보유량을 초과할 수 없음
-                sell_amount = min(sell_amount, self.holdings[i])
+                # 거래량 계산
+                trade_quantity = target_quantity - self.holdings[i]
                 
-                # 매도 실행 및 현금 증가
-                if sell_amount > 0:  # 0보다 큰 수량만 매도
-                    # 수수료 계산: 매도 금액의 일정 비율
-                    sell_value = sell_amount * current_prices[i]
-                    commission = sell_value * self.commission_rate
+                if trade_quantity > 0:  # 매수
+                    # 수수료 계산 (매수 금액의 일정 비율)
+                    commission = trade_quantity * current_prices[i] * self.commission_rate
                     
-                    # 실제 매도 금액 (수수료 차감)
-                    actual_sell_value = sell_value - commission
+                    # 사용할 현금 계산 (매수 금액 + 수수료)
+                    required_cash = trade_quantity * current_prices[i] + commission
                     
-                    # 현금 및 보유량 업데이트
-                    self.cash += actual_sell_value
-                    self.holdings[i] -= sell_amount
+                    # 사용 가능한 현금이 충분한지 확인
+                    if required_cash <= self.cash:
+                        # 매수 실행
+                        self.holdings[i] += trade_quantity
+                        self.cash -= required_cash
+                        total_commission += commission
+                    else:
+                        # 현금이 부족하면 가능한 만큼만 매수
+                        affordable_quantity = (self.cash / (current_prices[i] * (1 + self.commission_rate)))
+                        if affordable_quantity > 0:
+                            commission = affordable_quantity * current_prices[i] * self.commission_rate
+                            cost = affordable_quantity * current_prices[i] + commission
+                            self.holdings[i] += affordable_quantity
+                            self.cash -= cost
+                            total_commission += commission
+                
+                elif trade_quantity < 0:  # 매도
+                    # 매도 가능한 수량 확인
+                    sell_quantity = min(abs(trade_quantity), self.holdings[i])
+                    
+                    if sell_quantity > 0:
+                        # 수수료 계산 (매도 금액의 일정 비율)
+                        sell_value = sell_quantity * current_prices[i]
+                        commission = sell_value * self.commission_rate
+                        
+                        # 매도 실행
+                        self.holdings[i] -= sell_quantity
+                        self.cash += sell_value - commission
+                        total_commission += commission
 
-        # 매수 실행
+        # 거래 후 포트폴리오 가치 계산
+        self.portfolio_value = self.cash + np.sum(self.holdings * current_prices)
+        
+        # 각 자산의 실제 포트폴리오 내 비중 계산
+        self.weights[0] = self.cash / self.portfolio_value  # 현금 비중
         for i in range(self.n_assets):
-            delta_value = target_value_allocation[i] - current_values[i]
-            if delta_value > rebalance_threshold:  # 임계값보다 크게 매수할 경우만 실행
-                # 현재 보유 현금으로 매수 가능한 금액 계산 (모든 자산에 공평하게 분배)
-                max_buy_value = min(delta_value, self.cash)
-                
-                # 수수료를 고려한 실제 매수 가능 금액
-                # 매수 금액 = 총금액 / (1 + 수수료율)
-                actual_buy_value = max_buy_value / (1 + self.commission_rate)
-                
-                # 매수 수량 계산 (소수점 이하 잘라내기, 소수주 매수 불가)
-                buy_amount = np.floor(actual_buy_value / current_prices[i])
-                
-                if buy_amount > 0:  # 0보다 큰 수량만 매수
-                    # 수수료 포함 총 매수 비용
-                    total_cost = buy_amount * current_prices[i] * (1 + self.commission_rate)
-                    
-                    # 현금 및 보유량 업데이트
-                    self.cash -= total_cost
-                    self.holdings[i] += buy_amount
-
-        # 숫자 정밀도 오류 방지 (현금이 음수가 되지 않도록)
-        self.cash = max(0.0, self.cash)
+            self.weights[i + 1] = (self.holdings[i] * current_prices[i]) / self.portfolio_value
+        
+        return self.portfolio_value
 
     def render(self, mode="human"):
-        """(선택적) 환경 상태를 간단히 출력합니다."""
-        obs = self._get_observation()
-        current_prices = obs[:, 3]
-        print(f"스텝: {self.current_step}")
-        print(f"현금: {self.cash:.2f}")
-        print(f"주식 평가액: {np.dot(self.holdings, current_prices):.2f}")
-        print(f"총 포트폴리오 가치: {self.portfolio_value:.2f}")
+        """환경 상태를 시각화합니다."""
+        if mode != "human":
+            raise NotImplementedError(f"mode {mode}는 지원되지 않습니다.")
+            
+        info = self._get_info()
+        # 실제 렌더링 코드는 별도로 구현해야 함
+        return info
 
     def close(self):
-        """환경 관련 리소스를 정리합니다 (현재는 불필요)."""
+        """환경 종료 시 사용되며, 필요한 자원을 해제합니다."""
         pass 
