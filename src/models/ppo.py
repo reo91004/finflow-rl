@@ -36,7 +36,8 @@ from src.constants import (
     BATCH_SIZE,
     GRADIENT_CLIP,
     ENTROPY_COEF,
-    CRITIC_COEF
+    CRITIC_COEF,
+    DEFAULT_ENTROPY_COEF
 )
 from src.models.running_mean_std import RunningMeanStd
 
@@ -70,6 +71,7 @@ class PPO:
         self.logger = logger or logging.getLogger("PortfolioRL")  # 로거 없으면 기본 설정 사용
         self.n_assets = n_assets
         self.n_features = n_features  # 추가
+        self.entropy_coef = DEFAULT_ENTROPY_COEF  # 엔트로피 계수 추가
 
         # EMA 가중치 옵션
         self.use_ema = use_ema
@@ -488,7 +490,7 @@ class PPO:
                 
                 # 총 손실
                 # loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy_loss
-                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy_loss # past.py 계수 직접 사용
+                loss = actor_loss + 0.5 * critic_loss - self.entropy_coef * entropy_loss  # 설정된 엔트로피 계수 사용
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     self.logger.error(

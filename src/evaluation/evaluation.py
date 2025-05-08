@@ -474,6 +474,11 @@ def create_performance_table(result, benchmark_results=None, save_path=None, tit
     # 헤더 준비
     headers = ["지표", "포트폴리오"]
     
+    # 벤치마크 티커를 헤더에 미리 추가 (중복 방지)
+    if benchmark_results:
+        for ticker in benchmark_results.keys():
+            headers.append(ticker)
+    
     # 행 준비
     rows = []
     
@@ -495,10 +500,28 @@ def create_performance_table(result, benchmark_results=None, save_path=None, tit
         ("칼마 비율", result["metrics"].get("calmar_ratio", 0), ""),
     ]
     
+    # 벤치마크 지표 키 매핑 정의
+    metric_key_mapping = {
+        "총 수익률": "total_return",
+        "연간 수익률": "annualized_return",
+        "샤프 비율": "sharpe_ratio",
+        "소르티노 비율": "sortino_ratio",
+        "최대 낙폭": "max_drawdown",
+        "변동성": "annualized_volatility",
+        "승률": "win_rate",
+        "손익비": "gain_loss_ratio",
+        "최장 연속 상승": "positive_streak",
+        "최장 연속 하락": "negative_streak",
+        "베타": "beta",
+        "알파": "alpha",
+        "정보 비율": "information_ratio",
+        "칼마 비율": "calmar_ratio",
+    }
+    
     # 각 지표별 행 추가
     for name, value, unit in metrics_info:
         if "%" in unit:
-            row = [name, f"{value:.2f}{unit}"]
+            row = [name, f"{value*100:.2f}{unit}"]
         elif value > 100:
             row = [name, f"{value:.2f}{unit}"]
         else:
@@ -506,11 +529,10 @@ def create_performance_table(result, benchmark_results=None, save_path=None, tit
         
         # 벤치마크 지표 추가 (있는 경우)
         if benchmark_results:
-            for idx, (ticker, data) in enumerate(benchmark_results.items()):
-                if idx == 0:  # 첫 번째 벤치마크에서 헤더 추가
-                    headers.append(ticker)
-                
-                benchmark_value = data["metrics"].get(name.lower().replace(" ", "_").replace("/", "_"), 0)
+            metric_key = metric_key_mapping.get(name, name.lower().replace(" ", "_").replace("/", "_"))
+            
+            for ticker, data in benchmark_results.items():
+                benchmark_value = data["metrics"].get(metric_key, 0)
                 
                 if "%" in unit:
                     row.append(f"{benchmark_value*100:.2f}{unit}")

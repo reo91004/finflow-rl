@@ -10,8 +10,8 @@ import os
 
 # --- 상수 정의 ---
 # 학습 및 앙상블 설정
-NUM_EPISODES = 5000  # 학습 에피소드 수
-ENSEMBLE_SIZE = 10  # 앙상블 에이전트 수
+NUM_EPISODES = 100  # 학습 에피소드 수
+ENSEMBLE_SIZE = 5 # 앙상블 에이전트 수
 
 # 학습 스케줄 및 Early Stopping 설정
 EARLY_STOPPING_PATIENCE = 100  # 성능 향상이 없는 최대 에피소드 수
@@ -56,13 +56,13 @@ TRAIN_TEST_SPLIT_RATIO = 0.8  # 학습/테스트 데이터 분할 비율
 INITIAL_CASH = 1e6
 COMMISSION_RATE = 0.0005  # 수수료 현실화 (0.005 → 0.0005)
 # 새로운 매개변수: 행동 변화 페널티 계수
-ACTION_PENALTY_COEF = 0.01
+ACTION_PENALTY_COEF = 0.001
 
 # 새로운 행동 스케일링 계수
 DIRICHLET_SCALE_FACTOR = 10.0
 
 # 새로운 온도 스케일링 파라미터
-SOFTMAX_TEMPERATURE_INITIAL = 1.0
+SOFTMAX_TEMPERATURE_INITIAL = 2.0
 SOFTMAX_TEMPERATURE_MIN = 0.1
 SOFTMAX_TEMPERATURE_DECAY = 0.999
 
@@ -71,9 +71,9 @@ REWARD_ACCUMULATION_DAYS = 5
 
 # 보상 함수 관련 설정
 REWARD_SHARPE_WINDOW = 20  # Sharpe ratio 계산 윈도우 (15→10 에서 past.py 기본값 20으로 변경)
-REWARD_RETURN_WEIGHT = 0.75  # 수익률 가중치 (0.8→0.75)
-REWARD_SHARPE_WEIGHT = 0.25  # Sharpe ratio 가중치 (0.2→0.25)
-REWARD_DRAWDOWN_PENALTY = 0.15  # 드로우다운 페널티 계수 (0.1→0.15)
+REWARD_RETURN_WEIGHT = 0.6  # 수익률 가중치 (0.75 -> 0.6 과거 값으로 수정)
+REWARD_SHARPE_WEIGHT = 0.4  # Sharpe ratio 가중치 (0.25 -> 0.4 과거 값으로 수정)
+REWARD_DRAWDOWN_PENALTY = 0.2  # 드로우다운 페널티 계수 (0.15 -> 0.2 과거 값으로 수정)
 REWARD_VOL_SCALE_MIN = 0.85  # 변동성 기반 클리핑 최소값 (0.9→0.85)
 REWARD_VOL_SCALE_MAX = 1.15  # 변동성 기반 클리핑 최대값 (1.1→1.15)
 REWARD_LONG_TERM_BONUS = 0.1  # 장기 보상 보너스 계수 (0.05→0.1)
@@ -94,6 +94,7 @@ PPO_UPDATE_TIMESTEP = 400  # PPO 업데이트 주기 (500→400)
 BATCH_SIZE = 64  # 배치 사이즈
 GRADIENT_CLIP = 0.75  # 그래디언트 클리핑 값 (0.7→0.75)
 ENTROPY_COEF = 0.03  # 엔트로피 보너스 계수 (0.02→0.03)
+DEFAULT_ENTROPY_COEF = 0.03  # PPO 클래스에서 사용할 엔트로피 계수 (새로 추가)
 CRITIC_COEF = 0.8  # 크리틱 계수 (0.7→0.8)
 
 # 환경 설정

@@ -105,12 +105,6 @@ def train_agent(
     if NORMALIZE_STATES and env.obs_rms is not None:
         ppo_agent.obs_rms = env.obs_rms  # 정규화 상태 공유
     
-    # 탐색(exploration) 매개변수 수정
-    epsilon_start = 0.4  # 초기 탐색 확률
-    epsilon_final = 0.05  # 최종 탐색 확률
-    epsilon_decay = 0.99  # 탐색 확률 감쇠율
-    current_epsilon = epsilon_start  # 현재 탐색 확률
-    
     # 이동 평균을 위한 변수 추가
     moving_avg_size = 5  # 이동 평균 윈도우 크기
     recent_rewards = []  # 최근 보상 저장용
@@ -143,21 +137,8 @@ def train_agent(
                 truncated = True
                 break
                 
-            # 액션 선택 (개선된 탐색 전략)
-            if np.random.random() < current_epsilon:
-                # 탐색: 완전 랜덤 액션보다 더 스마트한 전략 사용
-                # 현재 정책의 액션을 기반으로 노이즈 추가
-                action_base, log_prob, value = ppo_agent.policy_old.act(state)
-                
-                # 노이즈 추가 (디리클레 분포 활용)
-                # 노이즈 크기는 현재 탐색 확률에 비례
-                noise_scale = current_epsilon * 1.0
-                noise = np.random.dirichlet(np.ones(len(action_base)) * (1.0/noise_scale))
-                action = (1 - current_epsilon) * action_base + current_epsilon * noise
-                action = action / np.sum(action)  # 합이 1이 되도록 정규화
-            else:
-                # 정책에 따른 행동 선택 (활용)
-                action, log_prob, value = ppo_agent.policy_old.act(state)
+            # PPO는 정책 자체가 확률적이므로, policy_old.act()를 통해 샘플링된 액션을 사용
+            action, log_prob, value = ppo_agent.policy_old.act(state)
             
             # 환경에서 한 스텝 진행
             next_state, reward, terminated, truncated, info = env.step(action)
@@ -231,14 +212,6 @@ def train_agent(
         # 현재 이동 평균 계산
         current_avg_reward = np.mean(recent_rewards)
         
-        # 탐색 확률 감소 (이동 평균 보상이 증가하면 더 빠르게 감소)
-        if len(recent_rewards) >= 2 and current_avg_reward > np.mean(recent_rewards[:-1]):
-            # 보상이 증가하면 탐색 확률을 더 빠르게 감소
-            current_epsilon = max(epsilon_final, current_epsilon * (epsilon_decay * 0.99))
-        else:
-            # 보상이 증가하지 않으면 기본 감소율 적용
-            current_epsilon = max(epsilon_final, current_epsilon * epsilon_decay)
-        
         # 학습 정체 상태 확인 및 대응
         if episode > moving_avg_size:
             if current_avg_reward > best_train_reward:
@@ -247,10 +220,10 @@ def train_agent(
             else:
                 no_improvement_count += 1
             
-            # 일정 기간 이상 개선이 없으면 탐색 확률 증가 (로컬 최적해 탈출)
+            # 일정 기간 이상 개선이 없는 경우 로직 수정
+            # 이제 탐색 확률 증가 대신 엔트로피 계수 조정 등 다른 방식 활용 가능
             if no_improvement_count >= 10:
-                logger.info(f"학습 정체 감지: 탐색 확률 증가 ({current_epsilon:.3f} -> {min(0.3, current_epsilon * 1.5):.3f})")
-                current_epsilon = min(0.3, current_epsilon * 1.5)  # 탐색 확률 50% 증가 (최대 0.3)
+                logger.info(f"학습 정체 감지: {no_improvement_count}회 연속으로 개선 없음")
                 no_improvement_count = 0  # 카운터 리셋
         
         # 에피소드가 끝났지만 메모리에 데이터가 충분하고 일정 주기가 지났으면 추가 업데이트
@@ -270,7 +243,6 @@ def train_agent(
             f"평균 보상: {current_avg_reward:.4f}, "
             f"포트폴리오: {portfolio_values[-1]:.2f}, "
             f"스텝: {step_count}, "
-            f"탐색: {current_epsilon:.3f}, "
             f"시간: {episode_time:.2f}초)"
         )
         

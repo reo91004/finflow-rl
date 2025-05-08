@@ -368,15 +368,6 @@ class StockPortfolioEnv(gym.Env):
             reward_norm = self._normalize_reward(raw_reward)
             return last_obs_norm.astype(np.float32), float(reward_norm), terminated, truncated, info
 
-        # 행동 변화 페널티 계산 (L1 거리)
-        # action_change_penalty = self.action_penalty_coef * np.sum(np.abs(action - self.prev_weights))
-        # 위 라인은 현재 action이 현금 비중을 포함하지 않으므로 past.py와 다름.
-        # past.py 방식대로 하려면 self.weights (현금 포함)와 비교해야 함.
-        # 현재 action은 에이전트의 출력 그대로이며, 현금 비중을 포함한다고 가정하고 진행. (PPO.select_action, ActorCritic.act 결과 확인 필요)
-        # 만약 action이 현금 미포함이라면, prev_weights도 현금 미포함 부분과 비교해야 함.
-        # 여기서는 일단 action이 현금 포함이라고 가정하고 past.py의 로직을 최대한 따름.
-        action_change_penalty = self.action_penalty_coef * np.sum(np.abs(action - self.prev_weights))
-
         # 거래 실행
         # 각 자산의 목표 가치 계산
         target_value_allocation = action[:-1] * prev_portfolio_value
@@ -438,41 +429,24 @@ class StockPortfolioEnv(gym.Env):
             # 변동성 기반 클리핑 스케일 업데이트
             self.volatility_scaling = self._calculate_volatility_scaling()
         
-        # --- 보상 계산 (past.py 스타일로 변경) ---
+        # --- 단순화된 보상 계산 (개선된 버전) ---
         
-        # 1. K-일 누적 수익률 계산
-        if len(self.portfolio_value_history) > REWARD_ACCUMULATION_DAYS:
-            k_day_ago_value = self.portfolio_value_history[-REWARD_ACCUMULATION_DAYS-1]
-            if k_day_ago_value > 1e-8:
-                k_day_return = (current_value_safe / k_day_ago_value) - 1
-            else:
-                k_day_return = -1.0
-        else:
-            # K일치 데이터가 없으면 일간 수익률 사용
-            k_day_return = daily_return
+        # 1. 포트폴리오 가치 변화율 (로그 수익률)
+        prev_value_safe = max(prev_portfolio_value, 1e-8)
+        current_value_safe = max(self.portfolio_value, 0.0)
         
-        # 2. Sharpe ratio 계산 (past.py 스타일)
-        sharpe_ratio = self._calculate_sharpe_ratio(window_size=REWARD_SHARPE_WINDOW) # past.py 기본값 사용
+        log_return = np.log(current_value_safe / prev_value_safe) if prev_value_safe > 0 and current_value_safe > 0 else 0.0
         
-        # 3. 드로우다운 페널티 계산 (past.py 스타일)
-        drawdown = self._calculate_drawdown()
-        drawdown_penalty = REWARD_DRAWDOWN_PENALTY * drawdown # 선형 페널티
+        # 2. 거래 비용 페널티 (action_change_penalty는 그대로 사용하되 약간 줄임)
+        weight_changes = np.abs(action - self.prev_weights)
+        threshold = 0.02  # 작은 변화는 무시
+        significant_changes = np.where(weight_changes > threshold, weight_changes, 0.0)
+        action_change_penalty = 0.001 * np.sum(significant_changes)  # 페널티 계수 약간 줄여봄 (0.002 -> 0.001)
         
-        # 4. 최종 보상 계산 (가중 합) - past.py 스타일
+        # 3. 단순화된 raw_reward
+        raw_reward = log_return - action_change_penalty
         
-        # 변동성 스케일링 적용 (높은 변동성 = 낮은 클리핑)
-        # self.volatility_scaling은 _calculate_volatility_scaling()에 의해 업데이트 된다고 가정.
-        scaled_return = k_day_return * self.volatility_scaling 
-        
-        # 수익률 기여도 (tanh로 비선형 클리핑)
-        return_component = np.tanh(scaled_return) * REWARD_RETURN_WEIGHT
-        
-        # Sharpe ratio 기여도 (-1~1 범위로 클리핑)
-        sharpe_component = np.clip(sharpe_ratio / 3.0, -1, 1) * REWARD_SHARPE_WEIGHT
-        
-        # 최종 보상 계산
-        raw_reward = return_component + sharpe_component - drawdown_penalty - action_change_penalty
-        
+        # NaN/Inf 처리는 유지
         if np.isnan(raw_reward) or np.isinf(raw_reward):
             raw_reward = -1.0 # NaN/Inf 발생 시 페널티 (past.py와 동일)
 
@@ -480,7 +454,7 @@ class StockPortfolioEnv(gym.Env):
         next_obs_norm = self._normalize_obs(next_obs_raw)
         reward_norm = self._normalize_reward(raw_reward) # 정규화된 보상
 
-        # 정보 업데이트
+        # 정보 업데이트 (기존 정보 유지 - 디버깅 목적)
         info = {
             "portfolio_value": self.portfolio_value,
             "cash": self.cash,
@@ -488,11 +462,13 @@ class StockPortfolioEnv(gym.Env):
             "weights": self.weights.copy(),
             "return": daily_return,
             "raw_reward": raw_reward, # 정규화 이전의 원본 보상
+            "log_return_reward_component": log_return, # 디버깅용
             "action_penalty": action_change_penalty,
-            "k_day_return": k_day_return,
-            "sharpe_ratio": sharpe_ratio,
-            "drawdown": drawdown,
-            "volatility_scaling": self.volatility_scaling
+            # 나머지 정보들은 계산되지 않으므로 주석처리
+            # "k_day_return": k_day_return if "k_day_return" in locals() else 0.0,
+            # "sharpe_ratio": sharpe_ratio,
+            # "drawdown": drawdown,
+            # "volatility_scaling": self.volatility_scaling,
         }
 
         return next_obs_norm.astype(np.float32), float(reward_norm), terminated, truncated, info
